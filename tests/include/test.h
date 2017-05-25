@@ -15,8 +15,7 @@
  *   limitations under the License.
  */
 
-#ifndef _JSAHN_TEST_H
-#define _JSAHN_TEST_H
+#pragma once
 
 #include <stdio.h>
 #include <time.h>
@@ -27,8 +26,17 @@
 
 #include "common.h"
 
-#ifdef __cplusplus
-extern "C" {
+#undef THREAD_SANITIZER
+#undef ADDRESS_SANITIZER
+#if __clang__
+#   if defined(__has_feature)
+#       if __has_feature(thread_sanitizer)
+#           define THREAD_SANITIZER
+#       endif
+#       if __has_feature(address_sanitizer)
+#           define ADDRESS_SANITIZER
+#       endif
+#   endif
 #endif
 
 #define _TEST_GLOBAL
@@ -66,10 +74,6 @@ extern "C" {
 
 #endif
 
-#ifdef __cplusplus
-}
-#endif
-
 #if defined(WIN32) || defined(_WIN32)
 #define SHELL_DEL "del /f "
 #define SHELL_COPY "copy "
@@ -89,7 +93,4 @@ extern "C" {
 #endif
 
 #include "memleak.h"
-
-#endif
-
 

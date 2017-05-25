@@ -35,20 +35,25 @@ static inline HANDLE handle_to_win(int fd)
     return (HANDLE)_get_osfhandle(fd);
 }
 
-int _filemgr_win_open(const char *pathname, int flags, mode_t mode)
+fdb_fileops_handle _filemgr_win_constructor(void *ctx) {
+    return fd_to_handle(-1);
+}
+
+fdb_status _filemgr_win_open(const char *pathname,
+                             fdb_fileops_handle *fileops_handle,
+                             int flags, mode_t mode)
 {
 #ifdef _MSC_VER
     int fd = _open(pathname, flags, mode);
     if (fd < 0) {
         errno_t err;
         _get_errno(&err);
-        if (err == ENOENT) {
-            return (int) FDB_RESULT_NO_SUCH_FILE;
-        } else {
-            return (int) FDB_RESULT_OPEN_FAIL;
-        }
+        return (fdb_status) convert_errno_to_fdb_status(err, FDB_RESULT_OPEN_FAIL);
     }
-    return fd;
+
+    *fileops_handle = fd_to_handle(fd);
+
+    return FDB_RESULT_SUCCESS;
 #else
     int fd;
     do {
@@ -56,18 +61,19 @@ int _filemgr_win_open(const char *pathname, int flags, mode_t mode)
     } while (fd == -1 && errno == EINTR);
 
     if (fd < 0) {
-        if (errno == ENOENT) {
-            return (int) FDB_RESULT_NO_SUCH_FILE;
-        } else {
-            return (int) FDB_RESULT_OPEN_FAIL;
-        }
+        return (fdb_status) convert_errno_to_fdb_status(errno, FDB_RESULT_OPEN_FAIL);
     }
-    return fd;
+
+    *fileops_handle = fd_to_handle(fd);
+
+    return FDB_RESULT_SUCCESS;
 #endif
 }
 
-ssize_t _filemgr_win_pwrite(int fd, void *buf, size_t count, cs_off_t offset)
+ssize_t _filemgr_win_pwrite(fdb_fileops_handle fileops_handle, void *buf,
+                            size_t count, cs_off_t offset)
 {
+    int fd = handle_to_fd(fileops_handle);
     HANDLE file = handle_to_win(fd);
     BOOL rv;
     DWORD byteswritten;
@@ -77,13 +83,21 @@ ssize_t _filemgr_win_pwrite(int fd, void *buf, size_t count, cs_off_t offset)
     winoffs.OffsetHigh = ((uint64_t)offset >> 32) & 0x7FFFFFFF;
     rv = WriteFile(file, buf, count, &byteswritten, &winoffs);
     if(!rv) {
-        return (ssize_t) FDB_RESULT_WRITE_FAIL;
+#ifdef _MSC_VER
+        errno_t err;
+        _get_errno(&err);
+        return (ssize_t) convert_errno_to_fdb_status(err, FDB_RESULT_WRITE_FAIL);
+#else
+        return (ssize_t) convert_errno_to_fdb_status(errno, FDB_RESULT_WRITE_FAIL);
+#endif
     }
     return (ssize_t) byteswritten;
 }
 
-ssize_t _filemgr_win_pread(int fd, void *buf, size_t count, cs_off_t offset)
+ssize_t _filemgr_win_pread(fdb_fileops_handle fileops_handle, void *buf,
+                           size_t count, cs_off_t offset)
 {
+    int fd = handle_to_fd(fileops_handle);
     HANDLE file = handle_to_win(fd);
     BOOL rv;
     DWORD bytesread;
@@ -93,13 +107,20 @@ ssize_t _filemgr_win_pread(int fd, void *buf, size_t count, cs_off_t offset)
     winoffs.OffsetHigh = ((uint64_t)offset >> 32) & 0x7FFFFFFF;
     rv = ReadFile(file, buf, count, &bytesread, &winoffs);
     if(!rv) {
-        return (ssize_t) FDB_RESULT_READ_FAIL;
+#ifdef _MSC_VER
+        errno_t err;
+        _get_errno(&err);
+        return (ssize_t) convert_errno_to_fdb_status(err, FDB_RESULT_READ_FAIL);
+#else
+        return (ssize_t) convert_errno_to_fdb_status(errno, FDB_RESULT_READ_FAIL);
+#endif
     }
     return (ssize_t) bytesread;
 }
 
-int _filemgr_win_close(int fd)
+int _filemgr_win_close(fdb_fileops_handle fileops_handle)
 {
+    int fd = handle_to_fd(fileops_handle);
 #ifdef _MSC_VER
     int rv = 0;
     if (fd != -1) {
@@ -107,7 +128,9 @@ int _filemgr_win_close(int fd)
     }
 
     if (rv < 0) {
-        return FDB_RESULT_CLOSE_FAIL;
+        errno_t err;
+        _get_errno(&err);
+        return (int) convert_errno_to_fdb_status(err, FDB_RESULT_CLOSE_FAIL);
     }
     return FDB_RESULT_SUCCESS;
 #else
@@ -119,62 +142,75 @@ int _filemgr_win_close(int fd)
     }
 
     if (rv < 0) {
-        return FDB_RESULT_CLOSE_FAIL;
+        return (int) convert_errno_to_fdb_status(errno, FDB_RESULT_CLOSE_FAIL);
     }
     return FDB_RESULT_SUCCESS;
 #endif
 }
 
-cs_off_t _filemgr_win_goto_eof(int fd)
+cs_off_t _filemgr_win_goto_eof(fdb_fileops_handle fileops_handle)
 {
 #ifdef _MSC_VER
-    cs_off_t rv = _lseeki64(fd, 0, SEEK_END);
+    cs_off_t rv = _lseeki64(handle_to_fd(fileops_handle), 0, SEEK_END);
     if (rv < 0) {
-        return (cs_off_t) FDB_RESULT_SEEK_FAIL;
+        errno_t err;
+        _get_errno(&err);
+        return (cs_off_t) convert_errno_to_fdb_status(err, FDB_RESULT_SEEK_FAIL);
     }
     return rv;
 #else
-    cs_off_t rv = lseek(fd, 0, SEEK_END);
+    cs_off_t rv = lseek(handle_to_fd(fileops_handle), 0, SEEK_END);
     if (rv < 0) {
-        return (cs_off_t) FDB_RESULT_SEEK_FAIL;
+        return (cs_off_t) convert_errno_to_fdb_status(errno, FDB_RESULT_SEEK_FAIL);
     }
     return rv;
 #endif
 }
 
-cs_off_t _filemgr_win_file_size(const char *filename)
+cs_off_t _filemgr_win_file_size(fdb_fileops_handle fileops_handle,
+                                const char *filename)
 {
 #ifdef _MSC_VER
     struct _stat st;
     if (_stat(filename, &st) == -1) {
-        return (cs_off_t) FDB_RESULT_READ_FAIL;
+        errno_t err;
+        _get_errno(&err);
+        return (cs_off_t) convert_errno_to_fdb_status(err, FDB_RESULT_READ_FAIL);
     }
     return st.st_size;
 #else
     struct stat st;
     if (stat(filename, &st) == -1) {
-        return (cs_off_t) FDB_RESULT_READ_FAIL;
+        return (cs_off_t) convert_errno_to_fdb_status(errno, FDB_RESULT_READ_FAIL);
     }
     return st.st_size;
 #endif
 }
 
-int _filemgr_win_fsync(int fd)
+int _filemgr_win_fsync(fdb_fileops_handle fileops_handle)
 {
+    int fd = handle_to_fd(fileops_handle);
     HANDLE file = handle_to_win(fd);
 
     if (!FlushFileBuffers(file)) {
-        return FDB_RESULT_FSYNC_FAIL;
+#ifdef _MSC_VER
+        errno_t err;
+        _get_errno(&err);
+        return (int) convert_errno_to_fdb_status(err, FDB_RESULT_FSYNC_FAIL);
+#else
+        return (int) convert_errno_to_fdb_status(errno, FDB_RESULT_FSYNC_FAIL);
+#endif
     }
     return FDB_RESULT_SUCCESS;
 }
 
-int _filemgr_win_fdatasync(int fd)
+int _filemgr_win_fdatasync(fdb_fileops_handle fileops_handle)
 {
-    return _filemgr_win_fsync(fd);
+    return _filemgr_win_fsync(fileops_handle);
 }
 
-void _filemgr_win_get_errno_str(char *buf, size_t size)
+void _filemgr_win_get_errno_str(fdb_fileops_handle fileops_handle,
+                                char *buf, size_t size)
 {
     if (!buf) {
         return;
@@ -193,46 +229,86 @@ void _filemgr_win_get_errno_str(char *buf, size_t size)
     LocalFree(win_msg);
 }
 
-int _filemgr_aio_init(struct async_io_handle *aio_handle)
+void *_filemgr_win_mmap(fdb_fileops_handle fileops_handle, size_t length, void **aux)
+{
+    int fd = handle_to_fd(fileops_handle);
+    HANDLE file = handle_to_win(fd);
+    HANDLE map = CreateFileMapping(file, NULL, PAGE_READWRITE, 0, length, NULL);
+    if (map == NULL) {
+        return NULL;
+    }
+    void *addr = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, length);
+    *aux = map;
+    return addr;
+}
+
+int _filemgr_win_munmap(fdb_fileops_handle fileops_handle,
+                        void *addr, size_t length, void *aux)
+{
+    (void) fileops_handle;
+    int ret;
+    ret = UnmapViewOfFile(addr);
+    if (ret) {
+        HANDLE map = aux;
+        CloseHandle(map);
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
+int _filemgr_aio_init(fdb_fileops_handle fileops_handle,
+                      struct async_io_handle *aio_handle)
 {
     return FDB_RESULT_AIO_NOT_SUPPORTED;
 }
 
-int _filemgr_aio_prep_read(struct async_io_handle *aio_handle, size_t aio_idx,
-                            size_t read_size, uint64_t offset)
+int _filemgr_aio_prep_read(fdb_fileops_handle fileops_handle,
+                           struct async_io_handle *aio_handle, size_t aio_idx,
+                           size_t read_size, uint64_t offset)
 {
     return FDB_RESULT_AIO_NOT_SUPPORTED;
 }
 
-int _filemgr_aio_submit(struct async_io_handle *aio_handle, int num_subs)
+int _filemgr_aio_submit(fdb_fileops_handle fileops_handle,
+                        struct async_io_handle *aio_handle, int num_subs)
 {
     return FDB_RESULT_AIO_NOT_SUPPORTED;
 }
 
-int _filemgr_aio_getevents(struct async_io_handle *aio_handle, int min,
+int _filemgr_aio_getevents(fdb_fileops_handle fileops_handle,
+                           struct async_io_handle *aio_handle, int min,
                            int max, unsigned int timeout)
 {
     return FDB_RESULT_AIO_NOT_SUPPORTED;
 }
 
-int _filemgr_aio_destroy(struct async_io_handle *aio_handle)
+int _filemgr_aio_destroy(fdb_fileops_handle fileops_handle,
+                         struct async_io_handle *aio_handle)
 {
     return FDB_RESULT_AIO_NOT_SUPPORTED;
 }
 
-int _filemgr_win_get_fs_type(int src_fd)
+int _filemgr_win_get_fs_type(fdb_fileops_handle src_fileops_handle)
 {
     return FILEMGR_FS_NO_COW;
 }
 
-int _filemgr_win_copy_file_range(int fstype, int src_fd, int dst_fd,
+int _filemgr_win_copy_file_range(int fstype,
+                                 fdb_fileops_handle src_fileops_handle,
+                                 fdb_fileops_handle dst_fileops_handle,
                                  uint64_t src_off, uint64_t dst_off,
                                  uint64_t len)
 {
     return FDB_RESULT_INVALID_ARGS;
 }
 
+void _filemgr_win_destructor(fdb_fileops_handle fileops_handle) {
+    (void)fileops_handle;
+}
+
 struct filemgr_ops win_ops = {
+    _filemgr_win_constructor,
     _filemgr_win_open,
     _filemgr_win_pwrite,
     _filemgr_win_pread,
@@ -242,6 +318,8 @@ struct filemgr_ops win_ops = {
     _filemgr_win_fdatasync,
     _filemgr_win_fsync,
     _filemgr_win_get_errno_str,
+    _filemgr_win_mmap,
+    _filemgr_win_munmap,
     // Async I/O operations
     _filemgr_aio_init,
     _filemgr_aio_prep_read,
@@ -249,7 +327,9 @@ struct filemgr_ops win_ops = {
     _filemgr_aio_getevents,
     _filemgr_aio_destroy,
     _filemgr_win_get_fs_type,
-    _filemgr_win_copy_file_range
+    _filemgr_win_copy_file_range,
+    _filemgr_win_destructor,
+    NULL
 };
 
 struct filemgr_ops * get_win_filemgr_ops()

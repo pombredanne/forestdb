@@ -21,6 +21,7 @@ void print_usage(void)
 {
     printf("\nUsage: forestdb_dump [OPTION]... [filename]\n"
     "\nOptions:\n"
+    "\n      --header-only         only print the header of a given ForestDB file"
     "\n      --key <key>           dump only specified document"
     "\n      --kvs <KV store name> name of KV store to be dumped"
     "\n      --byid                sort output by document id"
@@ -49,6 +50,7 @@ struct dump_option{
     bool print_key_in_hex;
     bool print_plain_meta;
     bool print_body_in_hex;
+    bool print_header_only;
     scan_mode_t scan_mode;
 };
 
@@ -96,23 +98,24 @@ void print_doc(fdb_kvs_handle *db,
                struct dump_option *opt)
 {
     uint8_t is_wal_entry;
-    uint64_t _offset;
+    int64_t _offset;
     void *key;
     keylen_t keylen;
     fdb_status wr;
     fdb_doc fdoc;
     struct docio_object doc;
+    struct _fdb_key_cmp_info cmp_info;
 
     memset(&doc, 0, sizeof(struct docio_object));
 
-    _offset = docio_read_doc(db->dhandle, offset, &doc, true);
-    if (_offset == offset) {
+    _offset = db->dhandle->readDoc_Docio(offset, &doc, true);
+    if (_offset <= 0) {
         return;
     }
     if (doc.length.flag & DOCIO_TXN_COMMITTED) {
         offset = doc.doc_offset;
-        _offset = docio_read_doc(db->dhandle, offset, &doc, true);
-        if (_offset == offset) {
+        _offset = db->dhandle->readDoc_Docio(offset, &doc, true);
+        if (_offset <= 0) {
             return;
         }
     }
@@ -136,9 +139,12 @@ void print_doc(fdb_kvs_handle *db,
     }
     printf("    Byte offset: %" _F64 "\n", offset);
 
+    cmp_info.kvs_config = db->kvs_config;
+    cmp_info.kvs = db->kvs;
     fdoc.key = doc.key;
     fdoc.keylen = doc.length.keylen;
-    wr = wal_find(&db->file->global_txn, db->file, &fdoc, &offset);
+    wr = db->file->getWal()->find_Wal(db->file->getGlobalTxn(), &cmp_info,
+                                      db->shandle, &fdoc, &offset);
     is_wal_entry = (wr == FDB_RESULT_SUCCESS)?(1):(0);
     printf("    Indexed by %s\n", (is_wal_entry)?("WAL"):("the main index"));
     printf("    Length: %d (key), %d (metadata), %d (body)\n",
@@ -187,8 +193,14 @@ int scan_docs(fdb_kvs_handle *db, struct dump_option *opt, char *kvs_name)
        if (fs == FDB_RESULT_SUCCESS) {
            offset = fdoc->offset;
            print_doc(db, kvs_name, offset, opt);
-       } else {
-           return -1;
+       } else { // MB-22046: Also need to be able to print deleted doc
+           fs = fdb_get_metaonly(db, fdoc);
+           if (fs == FDB_RESULT_SUCCESS) {
+               offset = fdoc->offset;
+               print_doc(db, kvs_name, offset, opt);
+           } else {
+               return -1;
+           }
        }
        fdb_doc_free(fdoc);
        fdoc = NULL;
@@ -244,11 +256,17 @@ int process_file(struct dump_option *opt)
         printf("\nUnable to open %s\n", filename);
         return -3;
     }
-    print_header(dbfile->root);
+    if (!opt->one_key && !opt->one_kvs) {
+        // MB-22046: Avoid dumping header for specific kvs or specific key dump
+        print_header(dbfile->getRootHandle());
+        if (opt->print_header_only) {
+            return 0;
+        }
+    }
 
     kvs_config = fdb_get_default_kvs_config();
 
-    if (dbfile->root->config.multi_kv_instances) {
+    if (dbfile->getRootHandle()->config.multi_kv_instances) {
         fdb_get_kvs_name_list(dbfile, &name_list);
         for (i=0; (uint64_t)i<name_list.num_kvs_names; ++i) {
             if (opt->one_kvs &&
@@ -269,7 +287,10 @@ int process_file(struct dump_option *opt)
             }
 
             ret = scan_docs(db, opt, name_list.kvs_names[i]);
-            if (ret == -1) {
+            if (ret == -1 && opt->one_kvs) {
+                // Only print key not found if a specific key is accompanied by
+                // a specific kv store.
+                // Otherwise scan all kv stores for the same key..
                 printf("KV store '%s': key not found\n", name_list.kvs_names[i]);
             }
             fdb_kvs_close(db);
@@ -339,6 +360,8 @@ int parse_options(int argc, char **argv, struct dump_option *opt)
                 opt->scan_mode = SCAN_BY_KEY;
             } else if (strncmp(argv[i], "--byseq", 16) == 0) {
                 opt->scan_mode = SCAN_BY_SEQ;
+            } else if (strncmp(argv[i], "--header-only", 13) == 0) {
+                opt->print_header_only = true;
             } else {
                 printf("\nUnknown option %s\n", argv[i]);
                 print_usage();

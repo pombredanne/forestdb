@@ -19,10 +19,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 #if !defined(WIN32) && !defined(_WIN32)
 #include <unistd.h>
 #endif
+
+#include <string>
+#include <map>
+#include <vector>
 
 #include "libforestdb/forestdb.h"
 #include "test.h"
@@ -46,42 +51,51 @@ void basic_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy test files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
+
+    // Get the ForestDB version
+    const char *version = fdb_get_lib_version();
+    TEST_CHK(version != NULL && strlen(version) > 0);
 
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.wal_threshold = 1024;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.compaction_threshold = 0;
     fconfig.purging_interval = 1;
 
     // Read-Write mode test without a create flag.
     fconfig.flags = 0;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_NO_SUCH_FILE);
     TEST_CHK(!strcmp(fdb_error_msg(status), "no such file"));
 
     // Read-Only mode test: Must not create new file.
     fconfig.flags = FDB_OPEN_FLAG_RDONLY;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_NO_SUCH_FILE);
 
     // Read-Only and Create mode: Must not create a new file.
     fconfig.flags = FDB_OPEN_FLAG_RDONLY | FDB_OPEN_FLAG_CREATE;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_INVALID_CONFIG);
     TEST_CHK(!strcmp(fdb_error_msg(status), "invalid configuration"));
 
     // open and close db with a create flag.
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     TEST_CHK(!strcmp(fdb_error_msg(status), "success"));
+    const char *file_version = fdb_get_file_version(dbfile);
+    TEST_CHK(file_version != NULL && strlen(file_version) > 0);
     fdb_close(dbfile);
 
     // reopen db
-    fdb_open(&dbfile, "./dummy1",&fconfig);
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+    fdb_open(&dbfile, "./func_test1",&fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc, (void *) "basic_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -97,7 +111,8 @@ void basic_test()
     }
 
     // remove document #5
-    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta, doc[5]->metalen, NULL, 0);
+    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta,
+                   doc[5]->metalen, NULL, 0);
     status = fdb_del(db, rdoc);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     fdb_doc_free(rdoc);
@@ -127,7 +142,7 @@ void basic_test()
     fdb_close(dbfile);
 
     // reopen
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc, (void *) "basic_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -167,7 +182,7 @@ void basic_test()
     }
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     // retrieve documents after compaction
     for (i=0;i<n;++i){
@@ -210,7 +225,8 @@ void basic_test()
     }
 
     // update document #5 with an empty doc body.
-    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta, doc[5]->metalen, NULL, 0);
+    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta,
+                   doc[5]->metalen, NULL, 0);
     status = fdb_set(db, rdoc);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     fdb_doc_free(rdoc);
@@ -229,7 +245,7 @@ void basic_test()
 
     // Read-Only mode test: Open succeeds if file exists, but disallow writes
     fconfig.flags = FDB_OPEN_FLAG_RDONLY;
-    status = fdb_open(&dbfile_rdonly, "./dummy2", &fconfig);
+    status = fdb_open(&dbfile_rdonly, "./func_test2", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile_rdonly, &db_rdonly, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -242,7 +258,7 @@ void basic_test()
                                   (void *) "basic_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
-    status = fdb_set(db_rdonly, doc[i]);
+    status = fdb_set(db_rdonly, doc[0]);
     TEST_CHK(status == FDB_RESULT_RONLY_VIOLATION);
     TEST_CHK(!strcmp(fdb_error_msg(status), "database is read-only"));
 
@@ -260,7 +276,7 @@ void basic_test()
     }
 
     // do one more compaction
-    fdb_compact(dbfile, (char *) "./dummy3");
+    fdb_compact(dbfile, (char *) "./func_test3");
 
     // close db file
     fdb_kvs_close(db);
@@ -272,6 +288,38 @@ void basic_test()
     memleak_end();
 
     TEST_RESULT("basic test");
+}
+
+void init_test()
+{
+    TEST_INIT();
+    memleak_start();
+
+    int r;
+    fdb_status status;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    status = fdb_init(&fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_close(dbfile);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_shutdown();
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    memleak_end();
+    TEST_RESULT("init test");
 }
 
 void set_get_max_keylen()
@@ -294,7 +342,7 @@ void set_get_max_keylen()
     fconfig.chunksize = 16;
 
 
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     for (int i = 0; i < len; ++i) {
@@ -303,7 +351,7 @@ void set_get_max_keylen()
     keybuf[len-1] = '\0';
 
     // open db
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -343,8 +391,8 @@ void config_test()
     size_t bcache_space_used;
     char fname[256];
 
-    // remove previous dummy test files
-    int r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     bcache_space_used = fdb_get_buffer_cache_used();
@@ -352,18 +400,23 @@ void config_test()
 
     fconfig = fdb_get_default_config();
     fconfig.buffercache_size= (uint64_t) -1;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_TOO_BIG_BUFFER_CACHE);
 
     fconfig = fdb_get_default_config();
     fconfig.max_writer_lock_prob = 120;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_INVALID_CONFIG);
+
+    fconfig = fdb_get_default_config();
+    fconfig.num_background_threads = 129;
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_INVALID_CONFIG);
 
     fconfig = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
     for (i = nfiles; i; --i) {
-        sprintf(fname, "dummy%d", i);
+        sprintf(fname, "func_test%d", i);
         status = fdb_open(&dbfile, fname, &fconfig);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
         status = fdb_kvs_open(dbfile, &db, "justonekv", &kvs_config);
@@ -371,12 +424,14 @@ void config_test()
 
         bcache_space_used = fdb_get_buffer_cache_used();
 
-        // Ensure just one block is used from the buffercache to store KV name
-        // DB header and it does not change since files are duly closed
-        TEST_CHK(bcache_space_used == fconfig.blocksize);
-        // We need to replace above check routine with following condition
-        // when V3 magic number is enabled:
-        //TEST_CHK(bcache_space_used == fconfig.blocksize * 2);
+        fdb_file_info finfo;
+        status = fdb_get_file_info(dbfile, &finfo);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        // Since V3 magic number, 9 blocks are used:
+        // 4 superblocks + KV name header*2 + Stale-tree root node + DB header*2
+        TEST_CHK(finfo.file_size == fconfig.blocksize * 9);
+        // Buffercache must only have KV name header*2 + stale-tree root
+        TEST_CHK(bcache_space_used == fconfig.blocksize * 3);
 
         status = fdb_close(dbfile);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -391,12 +446,9 @@ void config_test()
 
     bcache_space_used = fdb_get_buffer_cache_used();
 
-    // Two blocks must be used - 1 by DB header created earlier and
-    // One for the document block created by the fdb_set_kv
-    TEST_CHK(bcache_space_used == fconfig.blocksize * 2);
-    // We need to replace above check routine with following condition
-    // when V3 magic number is enabled:
-    //TEST_CHK(bcache_space_used == fconfig.blocksize * 3);
+    // Since V3 magic number, 10 blocks are used:
+    // 9 blocks created eariler + document block for KV pair
+    TEST_CHK(bcache_space_used == fconfig.blocksize * 10);
 
     fdb_close(dbfile);
 
@@ -404,6 +456,81 @@ void config_test()
 
     memleak_end();
     TEST_RESULT("forestdb config test");
+}
+
+void delete_reopen_test()
+{
+    TEST_INIT();
+    memleak_start();
+
+    int r;
+    fdb_file_handle *fh;
+    fdb_kvs_handle *db;
+    fdb_status status;
+    fdb_config fconfig;
+
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
+    (void)r;
+
+    fconfig = fdb_get_default_config();
+    fconfig.buffercache_size = 0;
+    fconfig.num_compactor_threads = 1;
+    status = fdb_open(&fh, "./func_test3", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_open_default(fh, &db, NULL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_begin_transaction(fh, FDB_ISOLATION_READ_COMMITTED);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_set_kv(db, (void *) "foo", 3, (void *)"value", 5);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_end_transaction(fh, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    void *value;
+    size_t valueSize;
+    status = fdb_get_kv(db, (void*)"foo", 3, &value, &valueSize);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    TEST_CHK(valueSize == 5);
+    TEST_CMP(value, "value", 5);
+    fdb_free_block(value);
+
+    status = fdb_begin_transaction(fh, FDB_ISOLATION_READ_COMMITTED);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_del_kv(db, "foo", 3);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_end_transaction(fh, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_get_kv(db, "foo", 3, &value, &valueSize);
+    TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+
+    status = fdb_close(fh);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Reopen:
+    status = fdb_open(&fh, "./func_test3", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_open_default(fh, &db, NULL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_get_kv(db, "foo", 3, &value, &valueSize);
+    TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+
+    status = fdb_close(fh);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_shutdown();
+
+    memleak_end();
+    TEST_RESULT("end trans delete & reopen passed");
 }
 
 void deleted_doc_get_api_test()
@@ -422,7 +549,7 @@ void deleted_doc_get_api_test()
     fdb_kvs_config kvs_config;
     char keybuf[256], bodybuf[256];
 
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     memset(doc, 0, sizeof(fdb_doc));
@@ -433,8 +560,9 @@ void deleted_doc_get_api_test()
     // open dbfile
     fconfig = fdb_get_default_config();
     fconfig.purging_interval = 1;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     kvs_config = fdb_get_default_kvs_config();
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -518,7 +646,7 @@ void deleted_doc_stat_test()
     fdb_kvs_config kvs_config;
     char keybuf[256], bodybuf[256];
 
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     memset(doc, 0, sizeof(fdb_doc));
@@ -530,7 +658,7 @@ void deleted_doc_stat_test()
     fconfig = fdb_get_default_config();
     fconfig.purging_interval = 0;
     kvs_config = fdb_get_default_kvs_config();
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(dbfile, &db, "main", &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -588,9 +716,9 @@ void complete_delete_test()
 
     memleak_start();
 
-    sprintf(path, "./dummy1");
+    sprintf(path, "./func_test1");
 
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     config = fdb_get_default_config();
@@ -644,13 +772,13 @@ void large_batch_write_no_commit_test()
     fdb_kvs_config kvs_config;
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     // open dbfile
     fconfig = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -672,7 +800,7 @@ void large_batch_write_no_commit_test()
     status = fdb_close(dbfile);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_NO_DB_HEADERS ||
              status == FDB_RESULT_SUCCESS); // No dirty pages are flushed into disk.
     if (status == FDB_RESULT_SUCCESS) {
@@ -700,15 +828,16 @@ void set_get_meta_test()
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.wal_threshold = 1024;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.purging_interval = 1;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open(dbfile, &db, "db1", &kvs_config);
 
     sprintf(keybuf, "key%d", 0);
@@ -877,8 +1006,8 @@ void seq_tree_exception_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -886,7 +1015,7 @@ void seq_tree_exception_test()
     fconfig.seqtree_opt = FDB_SEQTREE_NOT_USE;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "seq_tree_exception_test");
@@ -916,7 +1045,7 @@ void seq_tree_exception_test()
 
     // reopen with seq tree option
     fconfig.seqtree_opt = FDB_SEQTREE_USE;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     // must succeed
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
@@ -952,13 +1081,13 @@ void seq_tree_exception_test()
         fdb_doc_free(doc[i]);
     }
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     // open db
     fconfig.seqtree_opt = FDB_SEQTREE_USE;
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "seq_tree_exception_test");
@@ -985,7 +1114,7 @@ void seq_tree_exception_test()
 
     // reopen with an option disabling seq tree
     fconfig.seqtree_opt = FDB_SEQTREE_NOT_USE;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     // must succeed
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_close(dbfile);
@@ -1020,8 +1149,8 @@ void wal_commit_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -1032,7 +1161,7 @@ void wal_commit_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc, (void *) "wal_commit_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -1065,8 +1194,10 @@ void wal_commit_test()
     fdb_close(dbfile);
 
     // reopen
-    fdb_open(&dbfile, "./dummy1", &fconfig);
-    fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_set_log_callback(db, logCallbackFunc, (void *) "wal_commit_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
@@ -1124,14 +1255,14 @@ void db_close_and_remove()
     fdb_kvs_config kvs_config;
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     // open dbfile
     fconfig = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
     fconfig.cleanup_cache_onclose = false;
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
 
     // write to db
@@ -1152,12 +1283,12 @@ void db_close_and_remove()
     fdb_close(dbfile);
 
     // remove dbfile
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     // re-open read-only
     fconfig.flags = FDB_OPEN_FLAG_RDONLY;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_NO_SUCH_FILE);
 
     fdb_shutdown();
@@ -1181,8 +1312,8 @@ void db_drop_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -1193,7 +1324,7 @@ void db_drop_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "db_drop_test");
@@ -1215,11 +1346,11 @@ void db_drop_test()
     fdb_close(dbfile);
 
     // Remove the database file manually.
-    r = system(SHELL_DEL " dummy1 > errorlog.txt");
+    r = system(SHELL_DEL " func_test1 > errorlog.txt");
     (void)r;
 
     // Open the empty db with the same name.
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "db_drop_test");
@@ -1280,8 +1411,8 @@ void db_destroy_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     fconfig = fdb_get_default_config();
@@ -1292,7 +1423,7 @@ void db_destroy_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "db_destroy_test");
@@ -1312,7 +1443,7 @@ void db_destroy_test()
     fdb_commit(dbfile, FDB_COMMIT_NORMAL);
 
     // Open the empty db with the same name.
-    fdb_open(&dbfile2, "./dummy2", &fconfig);
+    fdb_open(&dbfile2, "./func_test2", &fconfig);
     fdb_kvs_open(dbfile2, &db2, NULL, &kvs_config);
     status = fdb_set_log_callback(db2, logCallbackFunc,
                                   (void *) "db_destroy_test");
@@ -1328,17 +1459,17 @@ void db_destroy_test()
     // Only close db not db2 and try to destroy
     fdb_close(dbfile);
 
-    status = fdb_destroy("./dummy2", &fconfig);
+    status = fdb_destroy("./func_test2", &fconfig);
     TEST_CHK(status == FDB_RESULT_FILE_IS_BUSY);
 
     //Now close the open db file
     fdb_close(dbfile2);
 
-    status = fdb_destroy("./dummy1", &fconfig);
+    status = fdb_destroy("./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
     // Open the same db with the same names.
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "db_destroy_test");
@@ -1425,21 +1556,22 @@ void operational_stats_test(bool multi_kv)
     real_doc.key = &keybuf;
     real_doc.body = &bodybuf;
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
 
     fconfig.buffercache_size = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
     r = 0;
 
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     if (multi_kv) {
         num_kv = 4;
         for (r = num_kv - 1; r >= 0; --r) {
@@ -1509,7 +1641,7 @@ void operational_stats_test(bool multi_kv)
 
     ++info.num_compacts;
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     status = fdb_get_kvs_ops_info(db[0], &rinfo);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -1579,8 +1711,8 @@ struct work_thread_args{
     fdb_kvs_config *kvs_config;
 };
 
-//#define FILENAME "./hdd/dummy"
-#define FILENAME "dummy"
+//#define FILENAME "./hdd/func_test"
+#define FILENAME "func_test"
 
 #define KSIZE (100)
 #define VSIZE (100)
@@ -1661,7 +1793,8 @@ void *_worker_thread(void *voidargs)
                     fdb_commit(dbfile, FDB_COMMIT_NORMAL);
                     commit_count++;
                     fdb_file_info info;
-                    fdb_get_file_info(dbfile, &info);
+                    status = fdb_get_file_info(dbfile, &info);
+                    TEST_CHK(status == FDB_RESULT_SUCCESS);
                     if (args->compact_term == (size_t)commit_count &&
                         args->compact_term > 0 &&
                         info.new_filename == NULL &&
@@ -1733,7 +1866,7 @@ void multi_thread_test(
 
     char keybuf[1024], metabuf[1024], bodybuf[1024], temp[1024];
 
-    // remove previous dummy files
+    // remove previous func_test files
     r = system(SHELL_DEL" " FILENAME "* > errorlog.txt");
     (void)r;
 
@@ -1751,8 +1884,10 @@ void multi_thread_test(
 
     // open db
     sprintf(temp, FILENAME"%d", filename_count);
-    fdb_open(&dbfile, temp, &fconfig);
-    fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    status = fdb_open(&dbfile, temp, &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "multi_thread_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -1771,10 +1906,12 @@ void multi_thread_test(
 
         fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
             (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
-        fdb_set(db, doc[i]);
+        status = fdb_set(db, doc[i]);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
     }
 
-    fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
 
     gettimeofday(&ts_cur, NULL);
     ts_gap = _utime_gap(ts_begin, ts_cur);
@@ -1830,9 +1967,12 @@ void multi_thread_test(
 
     // check sequence number
     sprintf(temp, FILENAME"%d", filename_count);
-    fdb_open(&dbfile, temp, &fconfig);
-    fdb_kvs_open_default(dbfile, &db, &kvs_config);
-    fdb_get_kvs_info(db, &kvs_info);
+    status = fdb_open(&dbfile, temp, &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_get_kvs_info(db, &kvs_info);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
     TEST_CHK(kvs_info.last_seqnum == ndocs+nwrites);
     fdb_kvs_close(db);
     fdb_close(dbfile);
@@ -1863,7 +2003,7 @@ void *multi_thread_client_shutdown(void *args)
     { // parent
         memleak_start();
 
-        r = system(SHELL_DEL" dummy* > errorlog.txt");
+        r = system(SHELL_DEL" func_test* > errorlog.txt");
         (void)r;
         nclients = 2;
         tid = alca(thread_t, nclients);
@@ -1888,7 +2028,7 @@ void *multi_thread_client_shutdown(void *args)
     fconfig.compaction_threshold = 0;
 
     // open/close db
-    status = fdb_open(&tdbfile, "./dummy1", &fconfig);
+    status = fdb_open(&tdbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     TEST_CHK(fdb_close(tdbfile) == FDB_RESULT_SUCCESS);
 
@@ -1925,7 +2065,7 @@ void *multi_thread_kvs_client(void *args)
     { // parent
         memleak_start();
 
-        r = system(SHELL_DEL" dummy* > errorlog.txt");
+        r = system(SHELL_DEL" func_test* > errorlog.txt");
         (void)r;
 
         // init dbfile
@@ -1934,7 +2074,7 @@ void *multi_thread_kvs_client(void *args)
         fconfig.wal_threshold = 1024;
         fconfig.compaction_threshold = 0;
 
-        status = fdb_open(&dbfile, "./dummy1", &fconfig);
+        status = fdb_open(&dbfile, "./func_test1", &fconfig);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
 
         tid = alca(thread_t, nclients);
@@ -2000,7 +2140,7 @@ void *multi_thread_kvs_client(void *args)
 
     // open fhandle
     fconfig = fdb_get_default_config();
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
     // get kvs ID from args
@@ -2029,6 +2169,129 @@ void *multi_thread_kvs_client(void *args)
     return NULL;
 }
 
+void *multi_thread_fhandle_share(void *args)
+{
+    TEST_INIT();
+    fdb_status status;
+    int n = 2000;
+    int i, r;
+    char tmpbuf[32];
+    typedef struct {
+        fdb_file_handle *dbfile;
+        fdb_kvs_handle *def;
+        fdb_kvs_handle *main;
+        fdb_kvs_handle *back;
+        bool isWriter;
+        std::atomic<bool> shutdown;
+    } thread_data_t;
+
+    if (args == NULL) { // MAIN THREAD..
+        int nthreads = 2; // Half of these are reader and half are writers
+        int nwriters = nthreads / 2;
+        thread_t *tid = new thread_t[nthreads];
+        thread_data_t *tdata = new thread_data_t[nthreads];
+        void **thread_ret = (void **)malloc(nthreads * sizeof (void *));
+        fdb_kvs_config kvs_config;
+        fdb_config fconfig;
+
+        r = system(SHELL_DEL" func_test* > errorlog.txt");
+        (void)r;
+
+        // Shared File Handle data...
+        fconfig = fdb_get_default_config();
+        fconfig.buffercache_size = 0;
+        fconfig.compaction_threshold = 0;
+        fconfig.num_compactor_threads = 1;
+        kvs_config = fdb_get_default_kvs_config();
+        for (i=0; i < nwriters; ++i) {
+            // Let Readers share same file handle as writers..
+            fdb_file_handle *dbfile;
+            sprintf(tmpbuf, "./func_test_pt.%d", i);
+            status = fdb_open(&dbfile, tmpbuf, &fconfig);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            tdata[i].dbfile = dbfile;
+            int ridx = i+nwriters; // reader index
+            tdata[ridx].dbfile = dbfile;
+            tdata[i].isWriter = true;
+            // Open separate KVS Handles for Readers..
+            tdata[ridx].isWriter = false; // Set for readers
+            status = fdb_kvs_open_default(dbfile, &tdata[ridx].def, &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_kvs_open(dbfile, &tdata[ridx].main, "main", &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_kvs_open(dbfile, &tdata[ridx].back, "back", &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            // Open Separate KVS Handle for Writers..
+            status = fdb_kvs_open_default(dbfile, &tdata[i].def, &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_kvs_open(dbfile, &tdata[i].main, "main", &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_kvs_open(dbfile, &tdata[i].back, "back", &kvs_config);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+        }
+        printf("Creating %d writers+readers over %d docs..\n", nwriters, n);
+        for (i=nthreads - 1;i>=0;--i){
+            tdata[i].shutdown = false;
+            thread_create(&tid[i], multi_thread_fhandle_share,
+                          reinterpret_cast<void *>(&tdata[i]));
+        }
+        for (i=0; i < nwriters; ++i) { // first wait for writers..
+            thread_join(tid[i], &thread_ret[i]);
+            printf("Writer %d done\n", i);
+            tdata[i+nwriters].shutdown = true; // tell reader to shutdown
+        }
+        for (;i<nthreads;++i){ // now wait for readers..
+            thread_join(tid[i], &thread_ret[i]);
+        }
+
+        for (i=0; i<nwriters;++i) {
+            status = fdb_close(tdata[i].dbfile);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+        }
+
+        delete[] tid;
+        delete[] tdata;
+        free(thread_ret);
+        fdb_shutdown();
+        TEST_RESULT("multi thread file handle share test");
+        return NULL;
+    }
+    // threads enter here ----
+    thread_data_t *tdata = reinterpret_cast<thread_data_t *>(args);
+    if (tdata->isWriter) { // Writer Threads Run this...
+        for (i=0; i < n; ++i) {
+            sprintf(tmpbuf, "key%03d", i);
+            status = fdb_set_kv(tdata->main, &tmpbuf, 7, nullptr, 0);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_set_kv(tdata->back, &tmpbuf, 7, nullptr, 0);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            status = fdb_set_kv(tdata->def, &tmpbuf, 7, nullptr, 0);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            if (n % 100 == 0) {
+                status = fdb_commit(tdata->dbfile,
+                                    FDB_COMMIT_MANUAL_WAL_FLUSH);
+                TEST_CHK(status != FDB_RESULT_HANDLE_BUSY);
+            }
+        }
+        return NULL;
+    } // else  Reader Threads Run this ...
+    while (!tdata->shutdown) {
+        for (i=0; i < n; ++i) {
+            void *value = nullptr;
+            size_t valuelen;
+            sprintf(tmpbuf, "key%03d", i);
+            status = fdb_get_kv(tdata->main, &tmpbuf, 7, &value, &valuelen);
+            TEST_CHK(status != FDB_RESULT_HANDLE_BUSY);
+            status = fdb_get_kv(tdata->back, &tmpbuf, 7, &value, &valuelen);
+            TEST_CHK(status != FDB_RESULT_HANDLE_BUSY);
+            status = fdb_get_kv(tdata->def, &tmpbuf, 7, &value, &valuelen);
+            TEST_CHK(status != FDB_RESULT_HANDLE_BUSY);
+        }
+    }
+
+    return NULL;
+}
+
 void incomplete_block_test()
 {
     TEST_INIT();
@@ -2045,8 +2308,8 @@ void incomplete_block_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2057,7 +2320,7 @@ void incomplete_block_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "incomplete_block_test");
@@ -2110,6 +2373,16 @@ void incomplete_block_test()
 static int _cmp_double(void *key1, size_t keylen1, void *key2, size_t keylen2)
 {
     double aa, bb;
+
+    if (!keylen1) {
+        // key1 not set
+        return -1;
+    }
+    if (!keylen2) {
+        // key2 not set
+        return 1;
+    }
+
     aa = *(double *)key1;
     bb = *(double *)key2;
 
@@ -2140,8 +2413,8 @@ void custom_compare_primitive_test()
     char keybuf[256], bodybuf[256];
     double key_double, key_double_prev;
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2155,7 +2428,7 @@ void custom_compare_primitive_test()
     kvs_config.custom_cmp = _cmp_double;
 
     // open db with custom compare function for double key type
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "custom_compare_primitive_test");
@@ -2201,7 +2474,7 @@ void custom_compare_primitive_test()
     fdb_iterator_close(iterator);
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     // range scan (after compaction)
     fdb_iterator_init(db, &iterator, NULL, 0, NULL, 0, 0x0);
@@ -2236,6 +2509,9 @@ void custom_compare_primitive_test()
 
 static int _cmp_variable(void *key1, size_t keylen1, void *key2, size_t keylen2)
 {
+    if (keylen1 < 6 || keylen2 < 6) {
+        return (keylen1 - keylen2);
+    }
     // compare only 3rd~8th bytes (ignore the others)
     return memcmp((uint8_t*)key1+2, (uint8_t*)key2+2, 6);
 }
@@ -2261,12 +2537,13 @@ void custom_compare_variable_test()
     char keybuf[256], bodybuf[256];
     char prev_key[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.seqtree_opt = FDB_SEQTREE_USE;
     fconfig.buffercache_size = 0;
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
@@ -2276,8 +2553,8 @@ void custom_compare_variable_test()
     kvs_config.custom_cmp = _cmp_variable;
 
     // open db with custom compare function for variable length key type
-    //fdb_open_cmp_variable(&dbfile, "./dummy1", &fconfig);
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    //fdb_open_cmp_variable(&dbfile, "./func_test1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "custom_compare_variable_test");
@@ -2351,7 +2628,7 @@ void custom_compare_variable_test()
     fdb_iterator_close(iterator);
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     // range scan (after compaction)
     fdb_iterator_init(db, &iterator, NULL, 0, NULL, 0, 0x0);
@@ -2428,6 +2705,117 @@ void custom_compare_variable_test()
     TEST_RESULT("custom compare function for variable length key test");
 }
 
+const int kcmp_offset = 100;
+static int _cmp_dups(void *a, size_t len_a, void *b, size_t len_b)
+{
+    TEST_INIT();
+    if (len_b) {
+        TEST_CHK(len_a == sizeof(int) && len_b == sizeof(int));
+    } else { // if fdb_iterator_init is called with NULL key
+        return len_a;
+    }
+    /*
+     * int keys must less than 'kcmp_offset'
+     */
+    int ia = *(int*) a;
+    int ib = *(int*) b;
+    while (ia > kcmp_offset)
+    {
+        ia -= kcmp_offset;
+    }
+    while (ib > kcmp_offset)
+    {
+        ib -= kcmp_offset;
+    }
+    return ia - ib;
+}
+
+void custom_compare_dups_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    // remove previous func_test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    fdb_file_handle *file;
+    fdb_kvs_handle *kv;
+    fdb_status status;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    const char *kvs_names[] = { "db0" };
+    fdb_custom_cmp_variable functions[] = { _cmp_dups };
+
+    config = fdb_get_default_config();
+    config.buffercache_size = 0;
+    // TODO: REMOVE THIS LINE AFTER MB-19901 is fixed
+    // Since a key is hashed by its bitwise checksum, key1=key2 as per custom
+    // cmp can end up in different hash partitions and not get deleted
+    // Workaround is to set number of wal paritions to 1
+    config.num_wal_partitions = 1;
+    status = fdb_open_custom_cmp(&file, "./func_test5", &config, 1,
+                                 (char **)kvs_names, functions);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    kvs_config = fdb_get_default_kvs_config();
+    kvs_config.custom_cmp = _cmp_dups;
+    status = fdb_kvs_open(file, &kv, "db0", &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    for (int i = 0; i < 10; i++)
+    {
+        char valbuf[100];
+        sprintf(valbuf, "val%06d", i);
+        status = fdb_set_kv(kv, &i, sizeof(int), valbuf, strlen(valbuf));
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+    status = fdb_commit(file, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    /*
+     * delete from 102 to 119, which should delete key 2 to 10 in previous keyset
+     * i + kcmp_offset == i in custom comparator 'fdb_custom_cmp_callback'
+     */
+    int k = 2 + kcmp_offset;
+    for (; k < 10 + kcmp_offset; k++)
+    {
+        fdb_del_kv(kv, &k, sizeof(k));
+    }
+    status = fdb_commit(file, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    /*
+     *  there should only keys '0'&'1' exist since key '2' to '10' are deleted
+     *  but we got keys '0', '1', '3', '8'
+     *
+     */
+    fdb_iterator* fdb_iter = NULL;
+    fdb_iterator_opt_t opt = FDB_ITR_NO_DELETES;
+    status = fdb_iterator_init(kv, &fdb_iter, NULL, 0, NULL, 0, opt);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    int count = 0;
+    do
+    {
+        fdb_doc* doc = NULL;
+        status = fdb_iterator_get(fdb_iter, &doc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        count++;
+        fdb_doc_free(doc);
+    } while (0 == fdb_iterator_next(fdb_iter));
+    fdb_iterator_close(fdb_iter);
+    // Fix By adding custom Hash method
+    // TEST_CHK(count == 2);
+
+    fdb_close(file);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("custom compare with duplicate where custom cmp!=bitwise cmp");
+}
+
 /*
  * custom compare test with commit and compact
  *    eqkeys:  boolean to toggle whether bytes in
@@ -2453,8 +2841,8 @@ void custom_compare_commit_compact(bool eqkeys)
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fconfig.buffercache_size = 0;
@@ -2465,14 +2853,11 @@ void custom_compare_commit_compact(bool eqkeys)
 
     kvs_config.custom_cmp = _cmp_variable;
 
-
-
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
-
     // open db
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -2552,8 +2937,8 @@ void custom_seqnum_test(bool multi_kv)
     real_doc.key = &keybuf;
     real_doc.body = &bodybuf;
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2562,11 +2947,12 @@ void custom_seqnum_test(bool multi_kv)
     fconfig.buffercache_size = 0;
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
     r = 0;
 
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     if (multi_kv) {
         num_kv = 4;
         for (r = num_kv - 1; r >= 0; --r) {
@@ -2575,7 +2961,7 @@ void custom_seqnum_test(bool multi_kv)
             status = fdb_kvs_open(dbfile, &db[r], tmp, &kvs_config);
             TEST_CHK(status == FDB_RESULT_SUCCESS);
             status = fdb_set_log_callback(db[r], logCallbackFunc,
-                                          (void *) "custom_seqnum_test");
+                    (void *) "custom_seqnum_test");
             TEST_CHK(status == FDB_RESULT_SUCCESS);
         }
     } else {
@@ -2591,7 +2977,7 @@ void custom_seqnum_test(bool multi_kv)
         sprintf(keybuf, "key%d", i);
         sprintf(bodybuf, "body%d", i);
         fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf) + 1, NULL, 0,
-            (void*)bodybuf, strlen(bodybuf)+1);
+                (void*)bodybuf, strlen(bodybuf)+1);
         for (r = num_kv - 1; r >= 0; --r) {
             status = fdb_set(db[r], doc[i]);
             TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -2602,7 +2988,7 @@ void custom_seqnum_test(bool multi_kv)
         sprintf(keybuf, "key%d", i);
         sprintf(bodybuf, "body%d", i);
         fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf) + 1, NULL, 0,
-            (void*)bodybuf, strlen(bodybuf)+1);
+                (void*)bodybuf, strlen(bodybuf)+1);
         for (r = num_kv - 1; r >= 0; --r) {
             fdb_doc_set_seqnum(doc[i], (i+1)*2); // double seqnum instead of ++
             status = fdb_set(db[r], doc[i]);
@@ -2632,7 +3018,7 @@ void custom_seqnum_test(bool multi_kv)
     }
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     for (i = n/2; i < n; ++i){
         sprintf(keybuf, "key%d", i);
@@ -2668,7 +3054,7 @@ void doc_compression_test()
 
     int i, r;
     int n = 10;
-    int dummy_len = 32;
+    int func_test_len = 32;
     fdb_file_handle *dbfile;
     fdb_kvs_handle *db;
     fdb_doc **doc = alca(fdb_doc*, n);
@@ -2677,8 +3063,8 @@ void doc_compression_test()
 
     char keybuf[256], metabuf[256], bodybuf[256], temp[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2691,15 +3077,15 @@ void doc_compression_test()
     fconfig.purging_interval = 1;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
-                                  (void *) "doc_compression_test");
+            (void *) "doc_compression_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
-    // set dummy str
-    memset(temp, 'a', dummy_len);
-    temp[dummy_len]=0;
+    // set func_test str
+    memset(temp, 'a', func_test_len);
+    temp[func_test_len]=0;
 
     // insert documents
     for (i=0;i<n;++i){
@@ -2707,7 +3093,7 @@ void doc_compression_test()
         sprintf(metabuf, "meta%d", i);
         sprintf(bodybuf, "body%d_%s", i, temp);
         fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
-            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+                (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
         fdb_set(db, doc[i]);
     }
 
@@ -2726,16 +3112,16 @@ void doc_compression_test()
     fdb_close(dbfile);
 
     // reopen
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
-                                  (void *) "doc_compression_test");
+            (void *) "doc_compression_test");
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
-    // update dummy str
-    dummy_len = 64;
-    memset(temp, 'b', dummy_len);
-    temp[dummy_len]=0;
+    // update func_test str
+    func_test_len = 64;
+    memset(temp, 'b', func_test_len);
+    temp[func_test_len]=0;
 
     // update document #0 and #1
     for (i=0;i<2;++i){
@@ -2771,7 +3157,7 @@ void doc_compression_test()
     }
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     // retrieve documents after compaction
     for (i=0;i<n;++i){
@@ -2826,8 +3212,8 @@ void read_doc_by_offset_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2839,7 +3225,7 @@ void read_doc_by_offset_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "read_doc_by_offset_test");
@@ -2904,7 +3290,7 @@ void read_doc_by_offset_test()
     fdb_doc_free(rdoc1);
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     fdb_doc_create(&rdoc, doc[50]->key, doc[50]->keylen, NULL, 0, NULL, 0);
     status = fdb_get_metaonly(db, rdoc);
@@ -2951,8 +3337,8 @@ void purge_logically_deleted_doc_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* fdb_test_config.json > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* fdb_test_config.json > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -2964,7 +3350,7 @@ void purge_logically_deleted_doc_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "purge_logically_deleted_doc_test");
@@ -2991,7 +3377,7 @@ void purge_logically_deleted_doc_test()
     fdb_commit(dbfile, FDB_COMMIT_NORMAL);
 
     // do compaction
-    fdb_compact(dbfile, (char *) "./dummy2");
+    fdb_compact(dbfile, (char *) "./func_test2");
 
     // retrieve documents after compaction
     for (i=0;i<n;++i){
@@ -3031,7 +3417,7 @@ void purge_logically_deleted_doc_test()
     sleep(3);
 
     // do one more compaction
-    fdb_compact(dbfile, (char *) "./dummy3");
+    fdb_compact(dbfile, (char *) "./func_test3");
 
     // retrieve documents after compaction
     for (i=0;i<n;++i){
@@ -3098,8 +3484,8 @@ void api_wrapper_test()
 
     char keybuf[256], bodybuf[256], temp[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3111,7 +3497,7 @@ void api_wrapper_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "api_wrapper_test");
@@ -3190,8 +3576,8 @@ void flush_before_commit_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3204,8 +3590,8 @@ void flush_before_commit_test()
     fconfig.wal_flush_before_commit = true;
 
     // open db
-    fdb_open(&dbfile, "dummy1", &fconfig);
-    fdb_open(&dbfile_txn, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
+    fdb_open(&dbfile_txn, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     fdb_kvs_open_default(dbfile_txn, &db_txn, &kvs_config);
     status = fdb_set_log_callback(db_txn, logCallbackFunc,
@@ -3284,7 +3670,7 @@ void flush_before_commit_test()
     }
 
     // do compaction
-    fdb_compact(dbfile, "dummy2");
+    fdb_compact(dbfile, "func_test2");
 
     for (i=20;i<25;++i){
         fdb_set(db_txn, doc[i]);
@@ -3331,8 +3717,8 @@ void flush_before_commit_multi_writers_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fconfig = fdb_get_default_config();
@@ -3346,7 +3732,7 @@ void flush_before_commit_multi_writers_test()
     kvs_config = fdb_get_default_kvs_config();
 
     // open db
-    fdb_open(&dbfile1, "dummy1", &fconfig);
+    fdb_open(&dbfile1, "func_test1", &fconfig);
     fdb_kvs_open(dbfile1, &db1, NULL, &kvs_config);
 
     // create & insert docs
@@ -3362,7 +3748,7 @@ void flush_before_commit_multi_writers_test()
     fdb_commit(dbfile1, FDB_COMMIT_MANUAL_WAL_FLUSH);
 
     // open second writer
-    fdb_open(&dbfile2, "dummy1", &fconfig);
+    fdb_open(&dbfile2, "func_test1", &fconfig);
     fdb_kvs_open(dbfile2, &db2, NULL, &kvs_config);
 
     for (i=0;i<n/2;++i){
@@ -3476,8 +3862,8 @@ void auto_commit_test()
     void *value_out;
     size_t valuelen;
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3489,7 +3875,7 @@ void auto_commit_test()
     fconfig.auto_commit = true;
 
     // open db
-    status = fdb_open(&dbfile, "dummy1", &fconfig);
+    status = fdb_open(&dbfile, "func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -3512,10 +3898,12 @@ void auto_commit_test()
         fdb_free_block(value_out);
     }
 
+    status = fdb_kvs_close(db);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
     // close & reopen
     status = fdb_close(dbfile);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
-    status = fdb_open(&dbfile, "dummy1", &fconfig);
+    status = fdb_open(&dbfile, "func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -3540,6 +3928,56 @@ void auto_commit_test()
     TEST_RESULT("auto commit test");
 }
 
+void auto_commit_space_used_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_status status;
+    fdb_config fconfig;
+    fdb_kvs_config kvs_config;
+    int ntimes = 4;
+    int i;
+    char fname[32];
+
+    // remove previous func_test test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    fconfig = fdb_get_default_config();
+    fconfig.buffercache_size= 0;
+    fconfig.auto_commit = true;
+
+    fconfig = fdb_get_default_config();
+    kvs_config = fdb_get_default_kvs_config();
+
+    for (i = ntimes; i; --i) {
+        sprintf(fname, "./func_test1");
+        status = fdb_open(&dbfile, fname, &fconfig);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_open(dbfile, &db, "justonekv", &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        fdb_file_info finfo;
+        status = fdb_get_file_info(dbfile, &finfo);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        // Since V3 magic number, 9 blocks are used:
+        // 4 superblocks + KV name header*2 + Stale-tree root node + DB header*2
+        TEST_CHK(finfo.file_size == fconfig.blocksize * 9);
+
+        status = fdb_close(dbfile);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    fdb_shutdown();
+
+    memleak_end();
+    TEST_RESULT("auto_commit space used on close test");
+}
+
 void last_wal_flush_header_test()
 {
     TEST_INIT();
@@ -3556,8 +3994,8 @@ void last_wal_flush_header_test()
 
     char keybuf[256], metabuf[256], bodybuf[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3568,8 +4006,8 @@ void last_wal_flush_header_test()
     fconfig.compaction_threshold = 0;
 
     // open db
-    fdb_open(&dbfile, "dummy1", &fconfig);
-    fdb_open(&dbfile_txn1, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
+    fdb_open(&dbfile_txn1, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
 
@@ -3598,8 +4036,8 @@ void last_wal_flush_header_test()
     // close & reopen db
     fdb_close(dbfile);
     fdb_close(dbfile_txn1);
-    fdb_open(&dbfile, "dummy1", &fconfig);
-    fdb_open(&dbfile_txn1, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
+    fdb_open(&dbfile_txn1, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
 
@@ -3630,8 +4068,8 @@ void last_wal_flush_header_test()
     // close & reopen db
     fdb_close(dbfile);
     fdb_close(dbfile_txn1);
-    fdb_open(&dbfile, "dummy1", &fconfig);
-    fdb_open(&dbfile_txn1, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
+    fdb_open(&dbfile_txn1, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
 
@@ -3659,7 +4097,7 @@ void last_wal_flush_header_test()
     fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
 
     // begin another transaction
-    fdb_open(&dbfile_txn2, "dummy1", &fconfig);
+    fdb_open(&dbfile_txn2, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile_txn2, &db_txn2, &kvs_config);
     fdb_begin_transaction(dbfile_txn2, FDB_ISOLATION_READ_COMMITTED);
     for (i=8;i<10;++i){
@@ -3671,7 +4109,7 @@ void last_wal_flush_header_test()
     fdb_close(dbfile);
     fdb_close(dbfile_txn1);
     fdb_close(dbfile_txn2);
-    fdb_open(&dbfile, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
 
     // retrieve check
@@ -3687,8 +4125,8 @@ void last_wal_flush_header_test()
         rdoc = NULL;
     }
 
-    fdb_open(&dbfile_txn1, "dummy1", &fconfig);
-    fdb_open(&dbfile_txn2, "dummy1", &fconfig);
+    fdb_open(&dbfile_txn1, "func_test1", &fconfig);
+    fdb_open(&dbfile_txn2, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
     fdb_kvs_open_default(dbfile_txn2, &db_txn2, &kvs_config);
     fdb_begin_transaction(dbfile_txn1, FDB_ISOLATION_READ_COMMITTED);
@@ -3715,7 +4153,7 @@ void last_wal_flush_header_test()
     fdb_close(dbfile);
     fdb_close(dbfile_txn1);
     fdb_close(dbfile_txn2);
-    fdb_open(&dbfile, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
 
     // retrieve check
@@ -3727,12 +4165,12 @@ void last_wal_flush_header_test()
         rdoc = NULL;
     }
 
-    fdb_open(&dbfile_txn1, "dummy1", &fconfig);
+    fdb_open(&dbfile_txn1, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
     fdb_begin_transaction(dbfile_txn1, FDB_ISOLATION_READ_COMMITTED);
     fdb_set(db_txn1, doc[20]);
 
-    fdb_compact(dbfile, "dummy2");
+    fdb_compact(dbfile, "func_test2");
 
     fdb_end_transaction(dbfile_txn1, FDB_COMMIT_MANUAL_WAL_FLUSH);
     fdb_close(dbfile);
@@ -3769,8 +4207,8 @@ void long_key_test()
     char *keybuf;
     char metabuf[256], bodybuf[256], temp[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL " dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3783,7 +4221,7 @@ void long_key_test()
     keybuf = alca(char, FDB_MAX_KEYLEN);
 
     // open db
-    fdb_open(&dbfile, "dummy1", &fconfig);
+    fdb_open(&dbfile, "func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
 
     // key structure:
@@ -3882,8 +4320,8 @@ void open_multi_files_kvs_test()
     fdb_kvs_info kvs_info;
     fdb_status status;
 
-    // remove previous dummy test files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -3894,7 +4332,7 @@ void open_multi_files_kvs_test()
 
     // 1024 kvs via 128 per dbfile
     for(j=0;j<n_files;++j){
-        sprintf(fname, "dummy%d", j);
+        sprintf(fname, "func_test%d", j);
         status = fdb_open(&dbfiles[j], fname, &fconfig);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
         for(i=0;i<n_kvs;++i){
@@ -3971,7 +4409,7 @@ void open_multi_files_kvs_test()
 
     // custom compact
     for(j=0;j<n_files;++j){
-        sprintf(fname, "dummy_compact%d", j);
+        sprintf(fname, "func_test_compact%d", j);
         status = fdb_compact(dbfiles[j], fname);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
     }
@@ -4015,14 +4453,14 @@ void get_byoffset_diff_kvs_test()
     fdb_status status;
     char keybuf[256], bodybuf[256];
 
-    // remove previous dummy test files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
 
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(dbfile, &db, "db", &kvs_config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -4083,8 +4521,8 @@ void rekey_test()
 
     char keybuf[256], bodybuf[256], temp[256];
 
-    // remove previous dummy files
-    r = system(SHELL_DEL" dummy* > errorlog.txt");
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
     (void)r;
 
     fdb_config fconfig = fdb_get_default_config();
@@ -4098,7 +4536,7 @@ void rekey_test()
     memset(fconfig.encryption_key.bytes, 0x42, sizeof(fconfig.encryption_key.bytes));
 
     // open db
-    fdb_open(&dbfile, "./dummy1", &fconfig);
+    fdb_open(&dbfile, "./func_test1", &fconfig);
     fdb_kvs_open_default(dbfile, &db, &kvs_config);
     status = fdb_set_log_callback(db, logCallbackFunc,
                                   (void *) "api_wrapper_test");
@@ -4116,6 +4554,26 @@ void rekey_test()
         TEST_STATUS(status);
     }
 
+    status = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_STATUS(status);
+
+    // close and reopen with wrong key
+    status = fdb_close(dbfile);
+    TEST_STATUS(status);
+
+    memset(fconfig.encryption_key.bytes, 0xff, sizeof(fconfig.encryption_key.bytes));
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    // must fail
+    TEST_CHK(status != FDB_RESULT_SUCCESS);
+
+    // open again
+    memset(fconfig.encryption_key.bytes, 0x42, sizeof(fconfig.encryption_key.bytes));
+    fdb_open(&dbfile, "./func_test1", &fconfig);
+    fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    status = fdb_set_log_callback(db, logCallbackFunc,
+                                  (void *) "api_wrapper_test");
+    TEST_STATUS(status);
+
     // change the encryption key:
     fdb_encryption_key new_key;
     new_key.algorithm = -1; // Bogus encryption
@@ -4131,7 +4589,7 @@ void rekey_test()
 
     // reopen db
     fconfig.encryption_key = new_key;
-    status = fdb_open(&dbfile, "./dummy1", &fconfig);
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
     TEST_STATUS(status);
     status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
     TEST_STATUS(status);
@@ -4163,10 +4621,918 @@ void rekey_test()
     TEST_RESULT("encryption rekey test");
 }
 
-int main(){
+void functional_test_func_test_cb(int err_code, const char *err_msg, void *ctx_data)
+{
+    (void)err_code;
+    (void)err_msg;
+    (void)ctx_data;
+    return;
+}
+
+void invalid_get_byoffset_test()
+{
+    TEST_INIT();
+    memleak_start();
+
+    int r;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_doc *rdoc;
+    fdb_status status;
+    fdb_config fconfig;
+    fdb_kvs_config kvs_config;
+    char keybuf[256], bodybuf[256];
+
+    r = system(SHELL_DEL " func_test* > errorlog.txt");
+    (void)r;
+
+    // open dbfile
+    fconfig = fdb_get_default_config();
+    fconfig.purging_interval = 1;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    kvs_config = fdb_get_default_kvs_config();
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_set_log_callback(db, functional_test_func_test_cb, NULL);
+
+    sprintf(keybuf, "key");
+    sprintf(bodybuf, "body");
+
+    /* Scenario 1: Fetch offset from empty file */
+
+    {
+        // Create a doc
+        fdb_doc_create(&rdoc, keybuf, strlen(keybuf),
+                NULL, 0, bodybuf, strlen(bodybuf));
+        status = fdb_set(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // close db file
+        fdb_kvs_close(db);
+        fdb_close(dbfile);
+
+        // open new dbfile
+        status = fdb_open(&dbfile, "./func_test1", &fconfig);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        fdb_set_log_callback(db, functional_test_func_test_cb, NULL);
+
+        // attempt to get key by previous offset,
+        // should fail as doc wasn't commited
+        status = fdb_get_byoffset(db, rdoc);
+        TEST_CHK(status != FDB_RESULT_SUCCESS);
+
+        fdb_doc_free(rdoc);
+    }
+
+    /* Scenario 2: Fetch invalid offset that points to a different data block
+       from same file */
+
+    {
+        // Create a doc
+        fdb_doc_create(&rdoc, keybuf, strlen(keybuf),
+                NULL, 0, bodybuf, strlen(bodybuf));
+        status = fdb_set(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Write 10 additional documents
+        fdb_doc **doc = alca(fdb_doc*, 10);
+        int i;
+        for (i = 0; i < 10; ++i) {
+            sprintf(keybuf, "key%d", i+1);
+            sprintf(bodybuf, "val%d", i+1);
+            fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+                           NULL, 0, (void*)bodybuf, strlen(bodybuf));
+            fdb_set(db, doc[i]);
+        }
+        uint64_t last_offset = doc[i-1]->offset;
+
+        // Commit the doc so it goes into main index
+        status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Free all the additional documents
+        for (i = 0; i < 10; ++i) {
+            fdb_doc_free(doc[i]);
+        }
+
+        // Incorrectly set rdoc's offset to the last saved doc's offset
+        rdoc->offset = last_offset;
+
+        // attempt to get key by incorrect offset belonging to a different
+        // data block
+        status = fdb_get_byoffset(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+
+        fdb_doc_free(rdoc);
+    }
+
+    /* Scenario 3: Fetch old offset from compacted file */
+
+    {
+        // Create doc
+        fdb_doc_create(&rdoc, keybuf, strlen(keybuf),
+                NULL, 0, bodybuf, strlen(bodybuf));
+        status = fdb_set(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Delete the doc
+        status = fdb_del(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        fdb_doc_free(rdoc);
+        sprintf(keybuf, "key0");
+        sprintf(bodybuf, "body0");
+
+        // Create doc again
+        fdb_doc_create(&rdoc, keybuf, strlen(keybuf),
+                       NULL, 0, bodybuf, strlen(bodybuf));
+        status = fdb_set(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Commit the doc so it goes into main index
+        status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Compact file
+        fdb_compact(dbfile, "./func_test2");
+
+        // close db file
+        fdb_kvs_close(db);
+        fdb_close(dbfile);
+
+        // open new dbfile
+        status = fdb_open(&dbfile, "./func_test2", &fconfig);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_open(dbfile, &db, NULL, &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        fdb_set_log_callback(db, functional_test_func_test_cb, NULL);
+
+        // attempt to get key by incorrect offset belonging to different file
+        status = fdb_get_byoffset(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_READ_FAIL);
+    }
+
+    /* Scenario 4: Fetch invalid offset that points to an index block
+       on same file */
+
+    {
+        uint8_t buf[4096];
+        FILE* fd = fopen("./func_test2", "r");
+        int64_t offset = 0;
+#if !defined(WIN32) && !defined(_WIN32)
+        while (pread(fileno(fd), buf, 4096, offset) == 4096) {
+            if (buf[4095] == BLK_MARKER_BNODE) {
+                // This means this block was an index block
+                // (last byte of the block is 0xff)
+                break;
+            }
+            offset += 4096;
+        }
+        fclose(fd);
+#else
+        DWORD bytesread;
+        OVERLAPPED winoffs;
+        memset(&winoffs, 0, sizeof(winoffs));
+        winoffs.Offset = offset & 0xFFFFFFFF;
+        winoffs.OffsetHigh = ((uint64_t)offset >> 32) & 0x7FFFFFFF;
+        while (ReadFile(fd, buf, 4096, &bytesread, &winoffs)) {
+            if (buf[4095] == BLK_MARKER_BNODE) {
+                // This means this block was an index block
+                // (last byte of the block is 0xff)
+                break;
+            }
+            offset += 4096;
+            winoffs.Offset = offset & 0xFFFFFFFF;
+            winoffs.OffsetHigh = ((uint64_t)offset >> 32) & 0x7FFFFFFF;
+        }
+        fclose(fd);
+#endif
+
+        // Set doc's offset to that of the index block
+        rdoc->offset = offset;
+
+        // attempt to get key by incorrect offset belonging to an index block
+        // (offset points to start of an index block)
+        status = fdb_get_byoffset(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_READ_FAIL);
+
+        // Set doc's offset to a random spot within that index block
+        rdoc->offset = offset + (rand() % 4096);
+
+        // attempt to get key by incorrect offset belonging to an index block
+        // (offset points to somewhere within the index block)
+        status = fdb_get_byoffset(db, rdoc);
+        TEST_CHK(status == FDB_RESULT_READ_FAIL);
+
+        // Free the document
+        fdb_doc_free(rdoc);
+    }
+
+    /* Scenario 5: Fetch invalid offset that points to a transaction commit marker
+       on same file */
+    {
+        size_t i;
+
+        // insert 100 docs using transaction
+        fdb_begin_transaction(dbfile, FDB_ISOLATION_READ_COMMITTED);
+        for (i=0;i<100;++i) {
+            sprintf(keybuf, "k%06d", (int)i);
+            sprintf(bodybuf, "v%06d", (int)i);
+            fdb_set_kv(db, keybuf, 8, bodybuf, 8);
+        }
+        fdb_end_transaction(dbfile, FDB_COMMIT_NORMAL);
+
+        // try to retrieve all possible offsets
+        for (i=0;i<100000;++i) {
+            sprintf(keybuf, "k%06d", (int)i);
+            fdb_doc_create(&rdoc, NULL, 0 , NULL, 0, NULL, 0);
+            rdoc->offset = i;
+            fdb_get_byoffset(db, rdoc);
+            fdb_doc_free(rdoc);
+        }
+    }
+
+    // close db file
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("invalid get by-offset test");
+}
+
+void dirty_index_consistency_test()
+{
+    TEST_INIT();
+    int i, r;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db[2];
+    fdb_iterator *fit;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_doc *doc, *rdoc;
+    fdb_status s; (void)s;
+    char keybuf[256], valuebuf[256];
+
+    memleak_start();
+
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    config = fdb_get_default_config();
+    config.buffercache_size = 0;
+    config.wal_threshold = 100;
+    kvs_config = fdb_get_default_kvs_config();
+
+    // create a file
+    s = fdb_open(&dbfile, "func_test", &config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db[0], NULL, &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db[1], NULL, &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    memset(keybuf, 0x0, 256);
+    memset(valuebuf, 0x0, 256);
+
+    // insert docs & dirty WAL flushing
+    for (i=0; i<1000; i++) {
+        sprintf(keybuf, "k%06d", i);
+        sprintf(valuebuf, "v%06d", i);
+        fdb_doc_create(&doc, keybuf, 8, NULL, 0, valuebuf, 9);
+        s = fdb_set(db[1], doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        fdb_doc_free(doc);
+    }
+
+    // get docks
+    for (i=0; i<1000; i++) {
+        sprintf(keybuf, "k%06d", i);
+        fdb_doc_create(&doc, keybuf, 8, NULL, 0, valuebuf, 9);
+        s = fdb_get(db[0], doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        fdb_doc_free(doc);
+    }
+    // now dirty blocks are cached in db[0]'s (default) bhandle
+
+    // more dirty WAL flushing
+    for (i=1000; i<3000; i++) {
+        sprintf(keybuf, "k%06d", i);
+        sprintf(valuebuf, "v%06d", i);
+        fdb_doc_create(&doc, keybuf, 8, NULL, 0, valuebuf, 9);
+        s = fdb_set(db[1], doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        fdb_doc_free(doc);
+    }
+
+    // commit - WAL flushing is executed on the default handle
+    s = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // count # docs
+    s = fdb_iterator_init(db[1], &fit, NULL, 0, NULL, 0, FDB_ITR_NONE);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    r = 0;
+    do {
+        rdoc = NULL;
+        s = fdb_iterator_get(fit, &rdoc);
+        if (s != FDB_RESULT_SUCCESS) break;
+        r++;
+        fdb_doc_free(rdoc);
+    } while (fdb_iterator_next(fit) == FDB_RESULT_SUCCESS);
+    fdb_iterator_close(fit);
+
+    TEST_CHK(r == 3000);
+
+    s = fdb_close(dbfile);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    fdb_shutdown();
+    memleak_end();
+
+    TEST_RESULT("dirty index consistency test");
+}
+
+void apis_with_invalid_handles_test() {
+    TEST_INIT();
+    fdb_file_handle *dbfile = NULL;
+    fdb_kvs_handle *db = NULL, *db1 = NULL;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_encryption_key new_key;
+    new_key.algorithm = FDB_ENCRYPTION_NONE;
+    memset(new_key.bytes, 0, sizeof(new_key.bytes));
+
+    memleak_start();
+
+    // remove previous func_test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    config = fdb_get_default_config();
+    kvs_config = fdb_get_default_kvs_config();
+
+    TEST_CHK(FDB_RESULT_SUCCESS == fdb_open(&dbfile, "func_test", &config));
+    TEST_CHK(FDB_RESULT_SUCCESS == fdb_kvs_open(dbfile, &db, NULL, &kvs_config));
+
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_snapshot_open(db, NULL,
+                                                            FDB_SNAPSHOT_INMEM));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_snapshot_open(NULL, NULL,
+                                                            FDB_SNAPSHOT_INMEM));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_rollback(&db1, 10));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_set_log_callback(NULL,
+                                                               logCallbackFunc,
+                                                               NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_get_byoffset(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_set(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_del(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_commit(NULL, FDB_COMMIT_NORMAL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_compact(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_compact_with_cow(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_rekey(NULL, new_key));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_seek(NULL, "key", 3, 0));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_seek_to_min(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_seek_to_max(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_prev(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_next(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_get(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_iterator_get_metaonly(NULL, NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_kvs_open(NULL, NULL, NULL,
+                                                       &kvs_config));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_kvs_close(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_begin_transaction(NULL,
+                                                  FDB_ISOLATION_READ_COMMITTED));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_abort_transaction(NULL));
+    TEST_CHK(FDB_RESULT_INVALID_HANDLE == fdb_end_transaction(NULL,
+                                                  FDB_COMMIT_NORMAL));
+
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("apis with invalid handles test");
+}
+
+void available_rollback_seqno_test(const char *kvs) {
+    TEST_INIT();
+    memleak_start();
+
+    int r, n = 30;
+    fdb_status status;
+    fdb_file_handle *dbfile = NULL;
+    fdb_kvs_handle *db = NULL;
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    status = fdb_init(&fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    if (kvs) {
+        status = fdb_kvs_open(dbfile, &db, kvs, &kvs_config);
+    } else {
+        // Default kv store
+        status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    }
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    uint64_t requestSeqno, rollbackSeqno;
+
+    requestSeqno = 5;
+    rollbackSeqno = fdb_get_available_rollback_seq(db, requestSeqno);
+    // No markers were found
+    TEST_CHK(rollbackSeqno == 0);
+
+    char keybuf[64], metabuf[64], bodybuf[64];
+    fdb_doc *rdoc = NULL;
+    for (int i = 1; i <= n; ++i) {
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&rdoc,
+                       (void*)keybuf, strlen(keybuf),
+                       (void*)metabuf, strlen(metabuf),
+                       (void*)bodybuf, strlen(bodybuf));
+        fdb_set(db, rdoc);
+        fdb_doc_free(rdoc);
+        if (i % 5 == 0) {
+            // Commit after every 5 mutations
+            status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+        }
+    }
+
+    requestSeqno = 20;
+    rollbackSeqno = fdb_get_available_rollback_seq(db, requestSeqno);
+    // Expect available rollback seqno to be equal to requestSeqno,
+    // because markers were created for every 5 insertions.
+    TEST_CHK(rollbackSeqno == requestSeqno);
+
+    requestSeqno = 27;
+    rollbackSeqno = fdb_get_available_rollback_seq(db, requestSeqno);
+    // Expect available rollback seqno to be 25,
+    // because markers were created for every 5 insertions.
+    TEST_CHK(rollbackSeqno == 25);
+
+    requestSeqno = 4;
+    rollbackSeqno = fdb_get_available_rollback_seq(db, requestSeqno);
+    // Expect available rollback seqno to be 0,
+    // because markers were created for every 5 insertions.
+    TEST_CHK(rollbackSeqno == 0);
+
+    requestSeqno = 7;
+    rollbackSeqno = fdb_get_available_rollback_seq(db, requestSeqno);
+    // Expect available rollback seqno to be 0,
+    // because default config has num_keeping_headers = 5,
+    // and the last existing markers would be at seqnos: 30, 25, 20, 15, 10.
+    TEST_CHK(rollbackSeqno == 0);
+
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    fdb_shutdown();
+
+    memleak_end();
+    if (kvs) {
+        TEST_RESULT("test fdb_get_available_rollback_seq with regular kvs");
+    } else {
+        TEST_RESULT("test fdb_get_available_rollback_seq with default kvs");
+    }
+}
+
+struct changes_ctx {
+    changes_ctx() : cancelOnSize(UINT_MAX) { }
+
+    const char *kvs_name;
+    std::vector<std::string> keys;
+    std::vector<std::string> metas;
+    std::vector<std::string> values;
+    size_t cancelOnSize;
+};
+
+fdb_changes_decision changes_cb(fdb_kvs_handle *handle, fdb_doc* doc, void *ctx) {
+    struct changes_ctx *cc = static_cast<struct changes_ctx *>(ctx);
+    fdb_kvs_info info;
+    fdb_get_kvs_info(handle, &info);
+    cc->kvs_name = info.name;
+    cc->keys.push_back(std::string((char*)doc->key, doc->keylen));
+    cc->metas.push_back(std::string((char*)doc->meta, doc->metalen));
+    if (doc->body) {
+        cc->values.push_back(std::string((char*)doc->body, doc->bodylen));
+    }
+    if (cc->keys.size() >= cc->cancelOnSize) {
+        return FDB_CHANGES_CANCEL;
+    } else {
+        return FDB_CHANGES_CLEAN;
+    }
+}
+
+void changes_since_test(const char *kvs) {
+    TEST_INIT();
+    memleak_start();
+
+    int r;
+    size_t i, j, n = 20;
+    fdb_status status;
+    fdb_file_handle *dbfile = NULL;
+    fdb_kvs_handle *db = NULL;
+    fdb_config fconfig = fdb_get_default_config();
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    status = fdb_init(&fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    if (kvs) {
+        status = fdb_kvs_open(dbfile, &db, kvs, &kvs_config);
+    } else {
+        // Default kv store
+        status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    }
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    char keybuf[64], metabuf[64], bodybuf[64];
+    fdb_doc *rdoc = NULL;
+    for (i = 1; i <= n; ++i) {
+        sprintf(keybuf, "key%lu", i);
+        sprintf(metabuf, "meta%lu", i);
+        sprintf(bodybuf, "body%lu", i);
+        fdb_doc_create(&rdoc,
+                       (void*)keybuf, strlen(keybuf),
+                       (void*)metabuf, strlen(metabuf),
+                       (void*)bodybuf, strlen(bodybuf));
+        fdb_set(db, rdoc);
+        fdb_doc_free(rdoc);
+    }
+
+    // Commit
+    status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    struct changes_ctx ctx;
+    // Fetch documents from seqnum 11
+    fdb_seqnum_t since = 11;
+
+    // Expect INVALID_HANDLE with NULL handle
+    status = fdb_changes_since(NULL, since, FDB_ITR_NONE,
+                               changes_cb, &ctx);
+    TEST_CHK(status == FDB_RESULT_INVALID_HANDLE);
+
+    // Expect INVALID_ARGS with NULL callback
+    status = fdb_changes_since(db, since, FDB_ITR_NONE,
+                               NULL, &ctx);
+    TEST_CHK(status == FDB_RESULT_INVALID_ARGS);
+
+    // Expect SUCCESS
+    status = fdb_changes_since(db, since, FDB_ITR_NONE,
+                               changes_cb, &ctx);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Check kvs name
+    if (!kvs) {
+        TEST_CHK(!strcmp(ctx.kvs_name, DEFAULT_KVS_NAME));
+    } else {
+        TEST_CHK(!strcmp(ctx.kvs_name, kvs));
+    }
+
+    // Should've fetched (n - 10) keys/metas/values, as since = 11
+    TEST_CHK(ctx.keys.size() == n - 10);
+    TEST_CHK(ctx.metas.size() == n - 10);
+    TEST_CHK(ctx.values.size() == n - 10);
+
+    // Check key names
+    j = since;
+    for (i = 0; i < ctx.keys.size(); ++i, ++j) {
+        TEST_CHK(ctx.keys.at(i) == std::string("key" + std::to_string(j)));
+        TEST_CHK(ctx.metas.at(i) == std::string("meta" + std::to_string(j)));
+        TEST_CHK(ctx.values.at(i) == std::string("body" + std::to_string(j)));
+    }
+
+    // Set context for limited iteration & keys only
+    ctx.keys.clear();
+    ctx.metas.clear();
+    ctx.values.clear();
+    ctx.cancelOnSize = 5;
+
+    // Expect CANCELLED
+    status = fdb_changes_since(db, since, FDB_ITR_NO_VALUES,
+                               changes_cb, &ctx);
+    TEST_CHK(status == FDB_RESULT_CANCELLED);
+
+    // Check kvs name
+    if (!kvs) {
+        TEST_CHK(!strcmp(ctx.kvs_name, DEFAULT_KVS_NAME));
+    } else {
+        TEST_CHK(!strcmp(ctx.kvs_name, kvs));
+    }
+
+    // Fetched key/meta/value count should be cancelOnSize
+    TEST_CHK(ctx.keys.size() == ctx.cancelOnSize);
+    TEST_CHK(ctx.metas.size() == ctx.cancelOnSize);
+    TEST_CHK(ctx.values.size() == 0);
+
+    // Check key names
+    j = since;
+    for (i = 0; i < ctx.keys.size(); ++i, ++j) {
+        TEST_CHK(ctx.keys.at(i) == std::string("key" + std::to_string(j)));
+        TEST_CHK(ctx.metas.at(i) == std::string("meta" + std::to_string(j)));
+    }
+
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    fdb_shutdown();
+
+    memleak_end();
+    if (kvs) {
+        TEST_RESULT("test fdb_changes_since with regular kvs");
+    } else {
+        TEST_RESULT("test fdb_changes_since with default kvs");
+    }
+}
+
+void kvs_deletion_without_commit()
+{
+
+    TEST_INIT();
+    int n_dbs=100, i, r;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db[100], *default_db;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_doc *doc;
+    fdb_status s; (void)s;
+    char keybuf[256], valuebuf[256];
+
+    memleak_start();
+
+    // remove previous func_test files
+    r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    config = fdb_get_default_config();
+    kvs_config = fdb_get_default_kvs_config();
+
+    // create a file
+    s = fdb_open(&dbfile, "func_test", &config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &default_db, NULL, &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    sprintf(keybuf, "k_default");
+    sprintf(valuebuf, "v_default");
+    s = fdb_doc_create(&doc, keybuf, strlen(keybuf)+1, NULL, 0, valuebuf, strlen(valuebuf)+1);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    s = fdb_set(default_db, doc);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    s = fdb_doc_free(doc);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    for (i=0; i<n_dbs; ++i) {
+        sprintf(keybuf, "partition%d\n", i);
+        s = fdb_kvs_open(dbfile, &db[i], keybuf, &kvs_config);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        sprintf(keybuf, "k%06d", i);
+        sprintf(valuebuf, "v%d", i);
+        s = fdb_doc_create(&doc, keybuf, strlen(keybuf)+1, NULL, 0, valuebuf, strlen(valuebuf)+1);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        s = fdb_set(db[i], doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        s = fdb_doc_free(doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+
+    s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_close(db[0]);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    sprintf(keybuf, "partition%d\n", 0);
+    s = fdb_kvs_remove(dbfile, keybuf);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // close without commit
+    s = fdb_close(dbfile);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // reopen file
+    s = fdb_open(&dbfile, "func_test", &config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    i = 0;
+    sprintf(keybuf, "partition%d\n", i);
+    s = fdb_kvs_open(dbfile, &db[i], keybuf, &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    sprintf(keybuf, "k%06d", i);
+    s = fdb_doc_create(&doc, keybuf, strlen(keybuf)+1, NULL, 0, NULL, 0);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    s = fdb_get(db[i], doc);
+    // should fail
+    TEST_CHK(s != FDB_RESULT_SUCCESS);
+
+    fdb_doc_free(doc);
+
+    s = fdb_close(dbfile);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_shutdown();
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    memleak_end();
+
+    TEST_RESULT("KVS deletion without commit test");
+}
+
+void latency_stats_histogram_test() {
+    TEST_INIT();
+
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fdb_status status;
+
+    char keybuf[128], bodybuf[128];
+
+    memleak_start();
+
+    // remove previous func_test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    int count = 100;
+    for (int i = 0; i < count; ++i) {
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "val%d", i);
+        status = fdb_set_kv(db, keybuf, strlen(keybuf), bodybuf, strlen(bodybuf));
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    fdb_latency_stat stat;
+    memset(&stat, 0, sizeof(fdb_latency_stat));
+    status = fdb_get_latency_stats(dbfile, &stat, FDB_LATENCY_SETS);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_assert(count == static_cast<int>(stat.lat_count),
+               count, static_cast<int>(stat.lat_count));
+
+    char *histogram;
+    size_t length;
+    status = fdb_get_latency_histogram(dbfile, &histogram, &length, FDB_LATENCY_SETS);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+#ifdef _PLATFORM_LIB_AVAILABLE
+    // Sample output: {(0µs - 1µs) : 90; (1µs - 2µs) : 10; }
+    TEST_CHK(length != 0);
+    TEST_CHK(histogram != nullptr);
+    free(histogram);
+#else
+    TEST_CHK(length == 0);
+    TEST_CHK(histogram == nullptr);
+#endif
+
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("latency stats with histogram test");
+}
+
+struct stats_ctx {
+    stats_ctx() : db(nullptr) { }
+
+    fdb_kvs_handle *db;
+    std::map<std::string, uint64_t> stats;
+};
+
+void stats_callback(fdb_kvs_handle *handle, const char *stat,
+                    uint64_t value, void *ctx) {
+    stats_ctx *ptr = static_cast<stats_ctx*>(ctx);
+    fdb_assert(ptr->db == handle, ptr->db, handle);
+    ptr->stats[stat] = value;
+}
+
+void handle_stats_test() {
+    TEST_INIT();
+
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_config fconfig = fdb_get_default_config();
+    fconfig.buffercache_size = 10240;   // 10KB
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fdb_status status;
+
+    // remove previous func_test files
+    int r = system(SHELL_DEL" func_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    status = fdb_open(&dbfile, "./func_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // issue a few sets
+    char keybuf[32], bodybuf[32];
+    int count = 100;
+    for (int i = 0; i < count; ++i) {
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "val%d", i);
+        status = fdb_set_kv(db, keybuf, strlen(keybuf), bodybuf, strlen(bodybuf));
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // commit normal
+    status = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    void *value;
+    size_t valuesize;
+
+    status = fdb_get_kv(db, "key99", 5, &value, &valuesize);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    TEST_CHK(valuesize == 5);
+    TEST_CMP(value, "val99", 5);
+    fdb_free_block(value);
+
+    status = fdb_get_kv(db, "key1", 4, &value, &valuesize);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    TEST_CHK(valuesize == 4);
+    TEST_CMP(value, "val1", 4);
+    fdb_free_block(value);
+
+    stats_ctx cb_ctx;
+    cb_ctx.db = db;
+
+    // fetch handle stats
+    status = fdb_fetch_handle_stats(db, stats_callback, &cb_ctx);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    TEST_CHK(cb_ctx.stats["Block_cache_hits"] + cb_ctx.stats["Block_cache_misses"] > 0);
+    TEST_CHK(cb_ctx.stats["Block_cache_num_items"] > 0);
+    TEST_CHK(cb_ctx.stats["Block_cache_num_victims"] > 0);
+
+    // commit with wal flush
+    status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // fetch handle stats again
+    status = fdb_fetch_handle_stats(db, stats_callback, &cb_ctx);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    TEST_CHK(cb_ctx.stats["Block_cache_hits"] + cb_ctx.stats["Block_cache_misses"] > 0);
+    TEST_CHK(cb_ctx.stats["Block_cache_num_items"] > 0);
+    TEST_CHK(cb_ctx.stats["Block_cache_num_victims"] > 0);
+
+    fdb_kvs_close(db);
+    fdb_close(dbfile);
+
+    fdb_shutdown();
+
+    TEST_RESULT("KVS handle stats test");
+}
+
+int main() {
+
     basic_test();
+    init_test();
     set_get_max_keylen();
     config_test();
+    delete_reopen_test();
     deleted_doc_get_api_test();
     deleted_doc_stat_test();
     complete_delete_test();
@@ -4182,6 +5548,7 @@ int main(){
     wal_commit_test();
     incomplete_block_test();
     custom_compare_primitive_test();
+    custom_compare_dups_test();
     custom_compare_variable_test();
     custom_compare_commit_compact(false);
     custom_compare_commit_compact(true);
@@ -4201,17 +5568,33 @@ int main(){
     flush_before_commit_test();
     flush_before_commit_multi_writers_test();
     auto_commit_test();
+    auto_commit_space_used_test();
     last_wal_flush_header_test();
     long_key_test();
-    large_batch_write_no_commit_test();
+#if !defined(ADDRESS_SANITIZER)
     multi_thread_client_shutdown(NULL);
+#endif
     multi_thread_kvs_client(NULL);
-    purge_logically_deleted_doc_test();
+    multi_thread_fhandle_share(NULL);
     operational_stats_test(false);
     operational_stats_test(true);
-    multi_thread_test(40*1024, 1024, 20, 1, 100, 2, 6);
     open_multi_files_kvs_test();
     rekey_test();
+    invalid_get_byoffset_test();
+    dirty_index_consistency_test();
+    kvs_deletion_without_commit();
+    purge_logically_deleted_doc_test();
+    large_batch_write_no_commit_test();
+    multi_thread_test(40*1024, 1024, 20, 1, 100, 2, 6);
+    apis_with_invalid_handles_test();
+
+    available_rollback_seqno_test(NULL);
+    available_rollback_seqno_test("kvs");
+    changes_since_test(NULL);
+    changes_since_test("kvs");
+
+    latency_stats_histogram_test();
+    handle_stats_test();
 
     return 0;
 }

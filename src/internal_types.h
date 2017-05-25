@@ -30,22 +30,66 @@
 extern "C" {
 #endif
 
-struct hbtrie;
 struct btree;
-struct filemgr;
+class FileMgr;
 struct btreeblk_handle;
-struct docio_handle;
+class DocioHandle;
 struct btree_blk_ops;
-struct snap_handle;
+struct Snapshot;
+
+class FdbKvsHandle;
+class HBTrie;
+class WalItr;
 
 #define OFFSET_SIZE (sizeof(uint64_t))
 
 #define FDB_MAX_KEYLEN_INTERNAL (65520)
 
+// Versioning information...
+// Version 003 - New non-block aligned BtreeV2
+#define FILEMGR_MAGIC_003 (UINT64_C(0xdeadcafebeefc003))
+// Version 002 - added stale-block tree info
+#define FILEMGR_MAGIC_002 (UINT64_C(0xdeadcafebeefc002))
+// Version 001 - added delta size to DB header and CRC-32C
+#define FILEMGR_MAGIC_001 (UINT64_C(0xdeadcafebeefc001))
+// Version 000 - old format (It involves various DB header formats so that we cannot
+//               identify those different formats by using magic number. To avoid
+//               unexpected behavior or crash, this magic number is no longer
+//               supported.)
+#define FILEMGR_MAGIC_000 (UINT64_C(0xdeadcafebeefbeef))
+
+// TODO: Set to 003 once BtreeV2 is ready
+#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_002
+
+
 /**
  * Error logging callback struct definition.
  */
-typedef struct {
+class ErrLogCallback {
+public:
+    ErrLogCallback() :
+        callback(NULL), ctx_data(NULL) { }
+
+    ErrLogCallback(fdb_log_callback _callback, void *_ctx_data) :
+        callback(_callback), ctx_data(_ctx_data) { }
+
+    fdb_log_callback getCallback(void) const {
+        return callback;
+    }
+
+    void *getCtxData(void) const {
+        return ctx_data;
+    }
+
+    void setCallback(fdb_log_callback _callback) {
+        callback = _callback;
+    }
+
+    void setCtxData(void *_ctx_data) {
+        ctx_data = _ctx_data;
+    }
+
+private:
     /**
      * Error logging callback function.
      */
@@ -55,11 +99,14 @@ typedef struct {
      * function.
      */
     void *ctx_data;
-} err_log_callback;
+};
 
 typedef struct _fdb_transaction fdb_txn;
 
 typedef uint64_t fdb_kvs_id_t;
+typedef uint16_t filemgr_header_len_t;
+typedef uint64_t filemgr_magic_t;
+typedef uint64_t filemgr_header_revnum_t;
 
 typedef uint8_t kvs_type_t;
 enum {
@@ -73,7 +120,42 @@ struct kvs_opened_node;
 /**
  * KV store info for each handle.
  */
-struct kvs_info {
+class KvsInfo {
+public:
+    KvsInfo() :
+        type(KVS_ROOT), id(0), root(NULL) { }
+
+    KvsInfo(const KvsInfo &info) :
+        type(info.type), id(info.id), root(info.root) { }
+
+    KvsInfo(kvs_type_t _type, fdb_kvs_id_t _id, FdbKvsHandle *_root):
+        type(_type), id(_id), root(_root) { }
+
+    kvs_type_t getKvsType() const {
+        return type;
+    }
+
+    fdb_kvs_id_t getKvsId() const {
+        return id;
+    }
+
+    FdbKvsHandle *getRootHandle() const {
+        return root;
+    }
+
+    void setKvsType(kvs_type_t _type) {
+        type = _type;
+    }
+
+    void setKvsId(fdb_kvs_id_t _id) {
+        id = _id;
+    }
+
+    void setRootHandle(FdbKvsHandle *_root) {
+        root = _root;
+    }
+
+private:
     /**
      * KV store type.
      */
@@ -85,7 +167,7 @@ struct kvs_info {
     /**
      * Pointer to root handle.
      */
-    fdb_kvs_handle *root;
+    FdbKvsHandle *root;
 };
 
 /**
@@ -104,7 +186,22 @@ typedef enum {
 /**
  * KV store statistics.
  */
-struct kvs_stat {
+class KvsStat {
+public:
+    KvsStat() :
+        nlivenodes(0), ndocs(0), ndeletes(0), datasize(0),
+        wal_ndocs(0), wal_ndeletes(0), deltasize(0) { }
+
+    void reset() {
+        nlivenodes = 0;
+        ndocs = 0;
+        ndeletes = 0;
+        datasize = 0;
+        wal_ndocs = 0;
+        wal_ndeletes = 0;
+        deltasize = 0;
+    }
+
     /**
      * The number of live index nodes.
      */
@@ -135,76 +232,71 @@ struct kvs_stat {
     int64_t deltasize;
 };
 
-// Versioning information...
-// Version 3 - added stale-block tree info
-#define FILEMGR_MAGIC_V3 (UINT64_C(0xdeadcafebeefc002))
-// Version 2 - added delta size to DB header and CRC-32C
-#define FILEMGR_MAGIC_V2 (UINT64_C(0xdeadcafebeefc001))
-#define FILEMGR_MAGIC_V1 (UINT64_C(0xdeadcafebeefbeef))
-#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_V3
-
 /**
  * Atomic counters of operational statistics in ForestDB KV store.
  */
-struct kvs_ops_stat {
+class KvsOpsStat {
+public:
+    KvsOpsStat() :
+        num_sets(0), num_dels(0), num_commits(0), num_compacts(0),
+        num_gets(0), num_iterator_gets(0), num_iterator_moves(0) { }
+
+    void reset() {
+        num_sets = 0;
+        num_dels = 0;
+        num_commits = 0;
+        num_compacts = 0;
+        num_gets = 0;
+        num_iterator_gets = 0;
+        num_iterator_moves = 0;
+    }
+
+    KvsOpsStat& operator=(const KvsOpsStat& ops_stat) {
+        num_sets.store(ops_stat.num_sets.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        num_dels.store(ops_stat.num_dels.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        num_commits.store(ops_stat.num_commits.load( std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        num_compacts.store(ops_stat.num_compacts.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        num_gets.store(ops_stat.num_gets.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        num_iterator_gets.store(ops_stat.num_iterator_gets.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        num_iterator_moves.store(ops_stat.num_iterator_moves.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        return *this;
+    }
+
     /**
      * Number of fdb_set operations.
      */
-    atomic_uint64_t num_sets;
+    std::atomic<uint64_t> num_sets;
     /**
      * Number of fdb_del operations.
      */
-    atomic_uint64_t num_dels;
+    std::atomic<uint64_t> num_dels;
     /**
      * Number of fdb_commit operations.
      */
-    atomic_uint64_t num_commits;
+    std::atomic<uint64_t> num_commits;
     /**
      * Number of fdb_compact operations on underlying file.
      */
-    atomic_uint64_t num_compacts;
+    std::atomic<uint64_t> num_compacts;
     /**
      * Number of fdb_get* (includes metaonly, byseq etc) operations.
      */
-    atomic_uint64_t num_gets;
+    std::atomic<uint64_t> num_gets;
     /**
      * Number of fdb_iterator_get* (includes meta_only) operations.
      */
-    atomic_uint64_t num_iterator_gets;
+    std::atomic<uint64_t> num_iterator_gets;
     /**
      * Number of fdb_iterator_moves (includes next,prev,seek) operations.
      */
-    atomic_uint64_t num_iterator_moves;
-};
-
-#define FHANDLE_ROOT_OPENED (0x1)
-#define FHANDLE_ROOT_INITIALIZED (0x2)
-#define FHANDLE_ROOT_CUSTOM_CMP (0x4)
-/**
- * ForestDB file handle definition.
- */
-struct _fdb_file_handle {
-    /**
-     * The root KV store handle.
-     */
-    fdb_kvs_handle *root;
-    /**
-     * List of opened default KV store handles
-     * (except for the root handle).
-     */
-    struct list *handles;
-    /**
-     * List of custom compare functions assigned by user
-     */
-    struct list *cmp_func_list;
-    /**
-     * Flags for the file handle.
-     */
-    uint64_t flags;
-    /**
-     * Spin lock for the file handle.
-     */
-    spin_t lock;
+    std::atomic<uint64_t> num_iterator_moves;
 };
 
 /**
@@ -218,265 +310,7 @@ struct _fdb_key_cmp_info {
     /**
      * KV store information.
      */
-    struct kvs_info *kvs;
-};
-
-/**
- * ForestDB KV store handle definition.
- */
-struct _fdb_kvs_handle {
-    /**
-     * ForestDB KV store level config. (Please retain as first struct member)
-     */
-    fdb_kvs_config kvs_config;
-    /**
-     * KV store information. (Please retain as second struct member)
-     */
-    struct kvs_info *kvs;
-    /**
-     * Operational statistics for this kv store.
-     */
-    struct kvs_ops_stat *op_stats;
-    /**
-     * Pointer to the corresponding file handle.
-     */
-    fdb_file_handle *fhandle;
-    /**
-     * HB+-Tree Trie instance.
-     */
-    struct hbtrie *trie;
-    /**
-     * Stale block B+-Tree instance.
-     * Maps from 'commit revision number' to 'stale block info' system document.
-     */
-    struct btree *staletree;
-    /**
-     * Sequence B+-Tree instance.
-     */
-    union {
-        struct btree *seqtree; // single KV instance mode
-        struct hbtrie *seqtrie; // multi KV instance mode
-    };
-    /**
-     * File manager instance.
-     */
-    struct filemgr *file;
-    /**
-     * Doc IO handle instance.
-     */
-    struct docio_handle *dhandle;
-    /**
-     * B+-Tree handle instance.
-     */
-    struct btreeblk_handle *bhandle;
-    /**
-     * B+-Tree block operation handle.
-     */
-    struct btree_blk_ops *btreeblkops;
-    /**
-     * File manager IO operation handle.
-     */
-    struct filemgr_ops *fileops;
-    /**
-     * ForestDB file level config.
-     */
-    fdb_config config;
-    /**
-     * Error logging callback.
-     */
-    err_log_callback log_callback;
-    /**
-     * File header revision number.
-     */
-    uint64_t cur_header_revnum;
-    /**
-     * Last header's block ID.
-     */
-    uint64_t last_hdr_bid;
-    /**
-     * Block ID of a header created with most recent WAL flush.
-     */
-    uint64_t last_wal_flush_hdr_bid;
-    /**
-     * File offset of a document containing KV instance info.
-     */
-    uint64_t kv_info_offset;
-    /**
-     * Snapshot Information.
-     */
-    struct snap_handle *shandle;
-    /**
-     * KV store's current sequence number.
-     */
-    fdb_seqnum_t seqnum;
-    /**
-     * KV store's max sequence number for snapshot or rollback.
-     */
-    fdb_seqnum_t max_seqnum;
-    /**
-     * Virtual filename (DB instance filename given by users).
-     */
-    char *filename;
-    /**
-     * Transaction handle.
-     */
-    fdb_txn *txn;
-    /**
-     * Atomic flag to detect if handles are being shared among threads.
-     */
-    atomic_uint8_t handle_busy;
-    /**
-     * Flag that indicates whether this handle made dirty updates or not.
-     */
-    uint8_t dirty_updates;
-    /**
-     * List element that will be inserted into 'handles' list in the root handle.
-     */
-    struct kvs_opened_node *node;
-#ifdef _TRACE_HANDLES
-    struct avl_node avl_trace;
-#endif
-};
-
-struct hbtrie_iterator;
-struct avl_tree;
-struct avl_node;
-
-/**
- * ForestDB iterator cursor movement direction
- */
-typedef uint8_t fdb_iterator_dir_t;
-enum {
-    /**
-     * Iterator cursor default.
-     */
-    FDB_ITR_DIR_NONE = 0x00,
-    /**
-     * Iterator cursor moving forward
-     */
-    FDB_ITR_FORWARD = 0x01,
-    /**
-     * Iterator cursor moving backwards
-     */
-    FDB_ITR_REVERSE = 0x02
-};
-
-/**
- * ForestDB iterator status
- */
-typedef uint8_t fdb_iterator_status_t;
-enum {
-    /**
-     * The last returned doc was retrieved from the main index.
-     */
-    FDB_ITR_IDX = 0x00,
-    /**
-     * The last returned doc was retrieved from the WAL.
-     */
-    FDB_ITR_WAL = 0x01
-};
-
-/**
- * ForestDB iterator structure definition.
- */
-struct _fdb_iterator {
-    /**
-     * ForestDB KV store handle.
-     */
-    fdb_kvs_handle *handle;
-    /**
-     * HB+Trie iterator instance.
-     */
-    struct hbtrie_iterator *hbtrie_iterator;
-    /**
-     * B+Tree iterator for sequence number iteration
-     */
-    struct btree_iterator *seqtree_iterator;
-    /**
-     * HB+Trie iterator for sequence number iteration
-     * (for multiple KV instance mode)
-     */
-    struct hbtrie_iterator *seqtrie_iterator;
-    /**
-     * Current seqnum pointed by the iterator.
-     */
-    fdb_seqnum_t _seqnum;
-    /**
-     * AVL tree for WAL entries.
-     */
-    struct avl_tree *wal_tree;
-    /**
-     * Cursor instance of AVL tree for WAL entries.
-     */
-    struct avl_node *tree_cursor;
-    /**
-     * Start position of AVL tree cursor.
-     */
-    struct avl_node *tree_cursor_start;
-    /**
-     * Previous position of AVL tree cursor.
-     */
-    struct avl_node *tree_cursor_prev;
-    /**
-     * Iterator start key.
-     */
-    void *start_key;
-    union {
-        /**
-         * Iterator start seqnum.
-         */
-        fdb_seqnum_t start_seqnum;
-        /**
-         * Start key length.
-         */
-        size_t start_keylen;
-    };
-    /**
-     * Iterator end key.
-     */
-    void *end_key;
-    union {
-        /**
-         * Iterator end seqnum.
-         */
-        fdb_seqnum_t end_seqnum;
-        /**
-         * End key length.
-         */
-        size_t end_keylen;
-    };
-    /**
-     * Iterator option.
-     */
-    fdb_iterator_opt_t opt;
-    /**
-     * Iterator cursor direction status.
-     */
-    fdb_iterator_dir_t direction;
-    /**
-     * The last returned document info.
-     */
-    fdb_iterator_status_t status;
-    /**
-     * Current key pointed by the iterator.
-     */
-    void *_key;
-    /**
-     * Length of key pointed by the iterator.
-     */
-    size_t _keylen;
-    /**
-     * Key offset.
-     */
-    uint64_t _offset;
-    /**
-     * Doc IO handle instance to the correct file.
-     */
-    struct docio_handle *_dhandle;
-    /**
-     * Cursor offset to key, meta and value on disk
-     */
-    uint64_t _get_offset;
+    KvsInfo *kvs;
 };
 
 struct wal_txn_wrapper;
@@ -488,11 +322,20 @@ struct _fdb_transaction {
     /**
      * ForestDB KV store handle.
      */
-    fdb_kvs_handle *handle;
+    FdbKvsHandle *handle;
+    /**
+     * Unique monotonically increasing transaction id to distinguish
+     * items that once belonged to a transaction which has ended.
+     */
+    uint64_t txn_id;
     /**
      * Block ID of the last header before the transaction begins.
      */
     uint64_t prev_hdr_bid;
+    /**
+     * Rev number of the last header before the transaction begins.
+     */
+    uint64_t prev_revnum;
     /**
      * List of dirty WAL items.
      */
@@ -509,7 +352,26 @@ struct _fdb_transaction {
 
 /* Global KV store header for each file
  */
-struct kvs_header {
+class KvsHeader {
+public:
+    KvsHeader(fdb_kvs_id_t _id_counter,
+              size_t _num_kv_stores)
+        : id_counter(_id_counter), default_kvs_cmp(nullptr),
+          custom_cmp_enabled(0), num_kv_stores(_num_kv_stores)
+    {
+        idx_name = (struct avl_tree*)malloc(sizeof(struct avl_tree));
+        avl_init(idx_name, nullptr);
+        idx_id = (struct avl_tree*)malloc(sizeof(struct avl_tree));
+        avl_init(idx_id, nullptr);
+        spin_init(&lock);
+    }
+
+    ~KvsHeader() {
+        free(idx_name);
+        free(idx_id);
+        spin_destroy(&lock);
+    }
+
     /**
      * Monotonically increasing counter to generate KV store IDs.
      */
@@ -568,11 +430,11 @@ struct kvs_node {
     /**
      * Operational CRUD statistics for this KV store (in-memory only).
      */
-    struct kvs_ops_stat op_stat;
+    KvsOpsStat op_stat;
     /**
      * Persisted KV store statistics.
      */
-    struct kvs_stat stat;
+    KvsStat stat;
     /**
      * Link to the global list of KV stores indexed by store name.
      */
@@ -609,10 +471,6 @@ struct stale_data {
      * Length of the stale data
      */
     uint32_t len;
-    union {
-        struct list_elem le;
-        struct avl_node avl;
-    };
 };
 
 /**
@@ -638,6 +496,65 @@ struct stale_regions {
 #define FDB_FLAG_SEQTREE_USE (0x1)
 #define FDB_FLAG_ROOT_INITIALIZED (0x2)
 #define FDB_FLAG_ROOT_CUSTOM_CMP (0x4)
+
+
+#define FDB_DOC_META_DELETED (0x1)
+
+/**
+ * Document meta data that will be stored as a value in HB+trie.
+ */
+struct DocMetaForIndex
+{
+    DocMetaForIndex() :
+        offset(BLK_NOT_FOUND), seqnum(SEQNUM_NOT_USED),
+        onDiskSize(0), flags(0)
+    {
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
+
+    DocMetaForIndex(uint64_t _offset,
+        uint64_t _seqnum,
+        uint32_t _on_disk_size,
+        uint8_t _flags) :
+        offset(_offset),
+        seqnum(_seqnum),
+        onDiskSize(_on_disk_size),
+        flags(_flags)
+    {
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
+
+    void encode() {
+        offset = _endian_encode(offset);
+        seqnum = _endian_encode(seqnum);
+        onDiskSize = _endian_encode(onDiskSize);
+    }
+
+    void decode() {
+        offset = _endian_decode(offset);
+        seqnum = _endian_decode(seqnum);
+        onDiskSize = _endian_decode(onDiskSize);
+    }
+
+    bool isDeleted() {
+        return flags & FDB_DOC_META_DELETED;
+    }
+
+    size_t size() {
+        return sizeof(DocMetaForIndex);
+    }
+
+    // Document disk offset.
+    uint64_t offset;
+    // Document sequence number.
+    uint64_t seqnum;
+    // Document on-disk size (compressed size if compression is enabled).
+    uint32_t onDiskSize;
+    // Additional flags.
+    uint8_t flags;
+    // Reserved bytes.
+    uint8_t reserved[3];
+};
 
 #ifdef __cplusplus
 }

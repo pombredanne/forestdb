@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include<mutex>
 #if !defined(WIN32) && !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -248,6 +249,7 @@ void crash_recovery_test(bool walflush)
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.buffercache_size = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
@@ -379,6 +381,7 @@ void snapshot_test()
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.buffercache_size = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
@@ -1084,6 +1087,147 @@ void in_memory_snapshot_test()
     TEST_RESULT("in-memory snapshot test");
 }
 
+void in_memory_snapshot_cleanup_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int r;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_kvs_handle *snap_db1, *snap_db2, *snap_db3;
+    fdb_kvs_handle *psnap_db1, *psnap_db2, *psnap_db3;
+    fdb_doc *doc = NULL;
+    fdb_doc *rdoc;
+    fdb_status status;
+
+    char keybuf[32], metabuf[32], bodybuf[32];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.wal_threshold = 1024;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.compaction_threshold = 0;
+    fconfig.block_reusing_threshold = 0;
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    status = fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_set_log_callback(db, logCallbackFunc,
+                                  (void *) "in_memory_snapshot_cleanup_test");
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    sprintf(keybuf, "key");
+    sprintf(metabuf, "meta");
+    sprintf(bodybuf, "body");
+    fdb_doc_create(&doc, (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+    fdb_set(db, doc);
+
+    // commit without a WAL flush
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    status = fdb_snapshot_open(db, &snap_db1, FDB_SNAPSHOT_INMEM);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_set(db, doc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // commit without a WAL flush
+    status = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_snapshot_open(db, &snap_db2, FDB_SNAPSHOT_INMEM);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_set(db, doc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // commit without a WAL flush
+    status = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_set(db, doc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // commit without a WAL flush
+    status = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_doc_free(doc);
+
+    // Update doc with new Key
+    char newKey[32];
+    sprintf(newKey, "Key");
+    fdb_doc_create(&doc, (void*)newKey, strlen(newKey),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+    fdb_set(db, doc);
+
+    status = fdb_snapshot_open(db, &snap_db3, FDB_SNAPSHOT_INMEM);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_doc_create(&rdoc, (void*)keybuf, strlen(keybuf), NULL, 0, NULL, 0);
+
+    status = fdb_get(snap_db1, rdoc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_get(snap_db2, rdoc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_get(snap_db3, rdoc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_doc_free(rdoc);
+
+    status = fdb_snapshot_open(db, &psnap_db1, 1);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_snapshot_open(db, &psnap_db2, 2);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_snapshot_open(db, &psnap_db3, 3);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // close snapshot handle
+    fdb_kvs_close(snap_db1);
+    fdb_kvs_close(snap_db2);
+    fdb_kvs_close(snap_db3);
+
+    // commit without a WAL flush
+    status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_kvs_close(psnap_db1);
+    fdb_kvs_close(psnap_db2);
+    fdb_kvs_close(psnap_db3);
+
+    // close db handle
+    fdb_kvs_close(db);
+
+    // close db file
+    fdb_close(dbfile);
+
+    fdb_doc_free(doc);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("in-memory snapshot cleanup test");
+}
 
 void in_memory_snapshot_on_dirty_hbtrie_test()
 {
@@ -1607,6 +1751,7 @@ void snapshot_clone_test()
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.buffercache_size = 0;
     fconfig.wal_threshold = 1024;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
 
@@ -2011,6 +2156,8 @@ void snapshot_markers_in_file_test(bool multi_kv)
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
+    // for creating the strict number of snapshots, disable block reusing
+    fconfig.block_reusing_threshold = 0;
 
     // remove previous mvcc_test files
     r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
@@ -2097,14 +2244,14 @@ void snapshot_markers_in_file_test(bool multi_kv)
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
     if (!multi_kv) {
-        TEST_CHK(num_markers == 4);
+        TEST_CHK(num_markers == 5);
         for (r = 0; r < num_kvs; ++r) {
             TEST_CHK(markers[r].num_kvs_markers == 1);
             TEST_CHK(markers[r].kvs_markers[0].seqnum
                      == (fdb_seqnum_t)(n - r*5));
         }
     } else {
-        TEST_CHK(num_markers == 8);
+        TEST_CHK(num_markers == 9);
         for (r = 0; r < num_kvs; ++r) {
             TEST_CHK(markers[r].num_kvs_markers == num_kvs);
             for (i = 0; i < num_kvs; ++i) {
@@ -2135,6 +2282,145 @@ void snapshot_markers_in_file_test(bool multi_kv)
     sprintf(bodybuf, "snapshot markers in file test %s", multi_kv ?
                                                         "multiple kv mode:"
                                                       : "single kv mode:");
+    TEST_RESULT(bodybuf);
+}
+
+void snapshot_without_seqtree(bool multi_kv)
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, j, r;
+    int n = 10;
+    int num_commits = 3, num_kvs = 3;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle **db = alca(fdb_kvs_handle *, num_kvs);
+    fdb_doc **doc = alca(fdb_doc*, n);
+    fdb_status status;
+    fdb_snapshot_info_t *markers;
+    uint64_t num_markers;
+
+    char keybuf[256], metabuf[256], bodybuf[256];
+    char kv_name[8];
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.multi_kv_instances = multi_kv;
+    // for creating the strict number of snapshots, disable block reusing
+    fconfig.block_reusing_threshold = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_NOT_USE;
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+    if (multi_kv) {
+        for (r = 0; r < num_kvs; ++r) {
+            sprintf(kv_name, "kv%d", r);
+            fdb_kvs_open(dbfile, &db[r], kv_name, &kvs_config);
+        }
+    } else {
+        num_kvs = 1;
+        fdb_kvs_open_default(dbfile, &db[0], &kvs_config);
+    }
+
+    // Load documents mulitple times
+    for (j=0; j < num_commits; ++j) {
+        for (i=0; i<n; i++){
+            sprintf(keybuf, "key%d", i);
+            sprintf(metabuf, "meta-%d-%d", j, i);
+            sprintf(bodybuf, "body-%d-%d", j, i);
+            fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+                           (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+            for (r = 0; r < num_kvs; ++r) {
+                fdb_set(db[r], doc[i]);
+            }
+            fdb_doc_free(doc[i]);
+        }
+        if (j % 2 == 0) {
+            fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        } else {
+            fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+        }
+    }
+
+    status = fdb_get_all_snap_markers(dbfile, &markers, &num_markers);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    if (!multi_kv) {
+        TEST_CHK(num_markers == 4);
+        for (r = 0; r < num_kvs; ++r) {
+            TEST_CHK(markers[r].num_kvs_markers == 1);
+            TEST_CHK(markers[r].kvs_markers[0].seqnum
+                     == (fdb_seqnum_t) (n * (num_commits - r)));
+        }
+    } else {
+        TEST_CHK(num_markers == 7);
+        for (r = 0; r < num_kvs; ++r) {
+            TEST_CHK(markers[r].num_kvs_markers == num_kvs);
+            for (i = 0; i < num_kvs; ++i) {
+                TEST_CHK(markers[r].kvs_markers[i].seqnum
+                         == (fdb_seqnum_t) (n * (num_commits - r)));
+                sprintf(kv_name, "kv%d", i);
+                TEST_CMP(markers[r].kvs_markers[i].kv_store_name, kv_name, 3);
+            }
+        }
+    }
+
+    fdb_kvs_handle *snap_db;
+    fdb_iterator *iterator;
+    fdb_doc *rdoc = NULL;
+    // Open the snapshot with the snapshot markers from the second commit
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_snapshot_open(db[r], &snap_db, markers[1].kvs_markers[r].seqnum);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Verify all the keys in the snapshot
+        status = fdb_iterator_init(snap_db, &iterator, NULL, 0, NULL, 0, FDB_ITR_NONE);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        i=0;
+        do {
+            status = fdb_iterator_get(iterator, &rdoc);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            sprintf(keybuf, "key%d", i);
+            sprintf(metabuf, "meta-1-%d", i);
+            sprintf(bodybuf, "body-1-%d", i);
+            TEST_CMP(rdoc->key, keybuf, rdoc->keylen);
+            TEST_CMP(rdoc->meta, metabuf, rdoc->metalen);
+            TEST_CMP(rdoc->body, bodybuf, rdoc->bodylen);
+            fdb_doc_free(rdoc);
+            rdoc = NULL;
+            i++;
+        } while (fdb_iterator_next(iterator) != FDB_RESULT_ITERATOR_FAIL);
+        TEST_CHK(i==n);
+        status = fdb_iterator_close(iterator);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Verify that a sequence-based iteration is not allowed.
+        status = fdb_iterator_sequence_init(snap_db, &iterator, 0, 0, FDB_ITR_NONE);
+        TEST_CHK(status != FDB_RESULT_SUCCESS);
+
+        status = fdb_kvs_close(snap_db);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    status = fdb_free_snap_markers(markers, num_markers);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // close db file
+    fdb_close(dbfile);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    sprintf(bodybuf, "snapshot without seqtree in %s",
+            multi_kv ? "multiple kv mode:" : "single kv mode:");
     TEST_RESULT(bodybuf);
 }
 
@@ -2297,16 +2583,18 @@ void rollback_forward_seqnum()
     fdb_kvs_info info;
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
-    fdb_doc **doc = alca(fdb_doc*, n);
+    fdb_doc **doc = alca(fdb_doc*, n+1);
     fdb_doc *rdoc = NULL;
     fdb_status status;
     r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
     (void)r;
 
     fconfig.wal_threshold = n;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.purging_interval = 5;
+    fconfig.block_reusing_threshold = 0;
 
     fdb_open(&dbfile, "./mvcc_test1", &fconfig);
     fdb_kvs_open(dbfile, &kv1, "kv1", &kvs_config);
@@ -2365,9 +2653,15 @@ void rollback_forward_seqnum()
     do {
         status = fdb_iterator_get(it, &rdoc);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
-        status = fdb_get_metaonly_byseq(kv1, rdoc);
-        TEST_CHK(status == FDB_RESULT_SUCCESS);
-        TEST_CHK(rdoc->deleted == false);
+        if (rdoc->seqnum != (uint64_t)n+1) {
+            status = fdb_get_metaonly_byseq(kv1, rdoc);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            TEST_CHK(rdoc->deleted == false);
+        } else {
+            status = fdb_get_metaonly(kv1, rdoc);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            TEST_CHK(rdoc->deleted == true);
+        }
         fdb_doc_free(rdoc);
         rdoc = NULL;
     } while(fdb_iterator_next(it) != FDB_RESULT_ITERATOR_FAIL);
@@ -2411,6 +2705,7 @@ void rollback_test(bool multi_kv)
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.buffercache_size = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
@@ -2683,6 +2978,7 @@ void rollback_ncommits()
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
+    fconfig.block_reusing_threshold = 0;
 
     fdb_open(&dbfile, "./mvcc_test1", &fconfig);
     fdb_kvs_open(dbfile, &kv1, "kv1", &kvs_config);
@@ -3197,6 +3493,387 @@ void transaction_simple_api_test()
     TEST_RESULT("transaction simple API test");
 }
 
+void *in_memory_snapshot_thread(void *args)
+{
+
+    TEST_INIT();
+
+    fdb_kvs_handle *db = (fdb_kvs_handle *)args;
+    fdb_kvs_handle *snap_db;
+    fdb_iterator *fit;
+    fdb_status status;
+    fdb_doc *doc;
+    char key[256], value[256];
+
+    // Open in-memory snapshot
+    status = fdb_snapshot_open(db, &snap_db, FDB_SNAPSHOT_INMEM);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Iterate the in-memory snapshot
+    status = fdb_iterator_init(snap_db, &fit, NULL, 0, NULL, 0, 0x0);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    int i = 0;
+    do {
+        doc = NULL;
+        status = fdb_iterator_get(fit, &doc);
+        if (status != FDB_RESULT_SUCCESS) {
+            break;
+        }
+        sprintf(key, "key%d", i);
+        sprintf(value, "body%d", i);
+        TEST_CMP(doc->key, key, doc->keylen);
+        TEST_CMP(doc->body, value, doc->bodylen);
+        i++;
+        fdb_doc_free(doc);
+    } while(fdb_iterator_next(fit) == FDB_RESULT_SUCCESS);
+    TEST_CHK(i == 10);
+
+    status = fdb_iterator_close(fit);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_close(snap_db);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // shutdown
+    thread_exit(0);
+    return NULL;
+}
+
+void transaction_in_memory_snapshot_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, r;
+    int n = 10;
+    fdb_file_handle *dbfile, *dbfile_txn1;
+    fdb_kvs_handle *db, *db_txn1;
+    fdb_status status;
+
+    char keybuf[256], bodybuf[256];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+    fconfig.wal_threshold = 1024;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.purging_interval = 0;
+    fconfig.compaction_threshold = 0;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+    fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    status = fdb_set_log_callback(db, logCallbackFunc,
+                                  (void *) "transaction_in_memory_snapshot_test");
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // insert the first set of key-value pairs
+    for (i=0;i<n;++i){
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "body%d", i);
+        status = fdb_set_kv(db, keybuf, strlen(keybuf), bodybuf,
+                            strlen(bodybuf));
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // commit
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    // open db and begin a transaction
+    fdb_open(&dbfile_txn1, "./mvcc_test1", &fconfig);
+    fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
+    fdb_begin_transaction(dbfile_txn1, FDB_ISOLATION_READ_COMMITTED);
+
+    // concurrently update docs
+    for (i=10;i<10000;++i){
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "body%d_txn1", i);
+        fdb_set_kv(db_txn1, keybuf, strlen(keybuf), bodybuf, strlen(bodybuf));
+    }
+
+    // Create in-memory snapshot thread
+    thread_t tid;
+    void *thread_ret;
+    thread_create(&tid, in_memory_snapshot_thread, (void *)db);
+
+    // commit txn1
+    fdb_end_transaction(dbfile_txn1, FDB_COMMIT_NORMAL);
+
+    thread_join(tid, &thread_ret);
+
+    // close db file
+    fdb_close(dbfile);
+    fdb_close(dbfile_txn1);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("transaction and in-memory snapshot interleaving test");
+}
+
+void transaction_post_commit_snapshot_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, r;
+    int n = 10;
+    size_t valuelen;
+    void *value;
+    fdb_file_handle *dbfile, *dbfile_txn1;
+    fdb_kvs_handle *db, *db_txn1;
+    fdb_iterator *iterator;
+    fdb_status status;
+
+    char keybuf[16], bodybuf[16];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+    fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    status = fdb_set_log_callback(db, logCallbackFunc,
+                          (void *) "transaction_post_commit_snapshot_test");
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // open db and begin transactions
+    fdb_open(&dbfile_txn1, "./mvcc_test1", &fconfig);
+    fdb_kvs_open_default(dbfile_txn1, &db_txn1, &kvs_config);
+
+    status = fdb_begin_transaction(dbfile_txn1, FDB_ISOLATION_READ_COMMITTED);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // concurrently update docs
+    for (i=0;i<n;++i){
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "body%d_txn1", i);
+        fdb_set_kv(db_txn1, keybuf, strlen(keybuf), bodybuf, strlen(bodybuf));
+    }
+
+    // retrieve key-value pairs
+    for (i=0;i<n;++i){
+        // general retrieval
+        sprintf(keybuf, "key%d", i);
+        status = fdb_get_kv(db, keybuf, strlen(keybuf), &value, &valuelen);
+        TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+
+        // txn1
+        sprintf(keybuf, "key%d", i);
+        sprintf(bodybuf, "body%d_txn1", i);
+        status = fdb_get_kv(db_txn1, keybuf, strlen(keybuf), &value, &valuelen);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        TEST_CMP(value, bodybuf, valuelen);
+        fdb_free_block(value);
+    }
+
+    // commit txn1
+    status = fdb_end_transaction(dbfile_txn1, FDB_COMMIT_NORMAL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_iterator_init(db, &iterator, NULL, 0, NULL, 0, FDB_ITR_NONE);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    i = 0;
+    do {
+        fdb_doc *rdoc = NULL;
+        status = fdb_iterator_get(iterator, &rdoc);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        sprintf(keybuf, "key%d", i);
+        TEST_CMP(rdoc->key, keybuf, rdoc->keylen);
+        fdb_doc_free(rdoc);
+        i++;
+
+    } while (fdb_iterator_next(iterator) != FDB_RESULT_ITERATOR_FAIL);
+    fdb_iterator_close(iterator);
+    TEST_CHK(i == n);
+
+    // close db file
+    fdb_close(dbfile);
+    fdb_close(dbfile_txn1);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("transaction post commit snapshot test");
+}
+
+struct piterator_ctx {
+    fdb_config *config;
+    int num_docs;
+    const char *filename;
+    std::mutex lock;
+};
+
+void *parallel_iterator_thread(void *args)
+{
+    TEST_INIT();
+
+    struct piterator_ctx *ctx = (struct piterator_ctx *)args;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_kvs_handle *snap_db;
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fdb_iterator *fit, *fit2;
+    fdb_status status;
+    fdb_seqnum_t snap_seqnum;
+    int num_read = 0;
+    fdb_doc *doc;
+    char key[16];
+
+    while (num_read < ctx->num_docs) {
+        status = fdb_open(&dbfile, ctx->filename, ctx->config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        ctx->lock.lock();
+        // Open in-memory snapshot
+        status = fdb_snapshot_open(db, &snap_db, FDB_SNAPSHOT_INMEM);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        ctx->lock.unlock();
+
+        fdb_get_kvs_seqnum(snap_db, &snap_seqnum);
+        // Iterate the in-memory snapshot
+        status = fdb_iterator_init(snap_db, &fit, 0, 0, 0, 0, FDB_ITR_NONE);
+        fdb_iterator_sequence_init(snap_db, &fit2, 0, 0, FDB_ITR_NONE);
+
+        if (status == FDB_RESULT_ITERATOR_FAIL) {
+            continue;
+        }
+        int i = 0;
+        while (status == FDB_RESULT_SUCCESS) {
+            doc = NULL;
+            status = fdb_iterator_get(fit, &doc);
+            if (status != FDB_RESULT_SUCCESS) {
+                break;
+            }
+            sprintf(key, "key%05d", i);
+            TEST_CMP(doc->key, key, doc->keylen);
+            TEST_CHK(doc->seqnum == static_cast<uint64_t>(i+1));
+            // printf("Got %s seqnum %llu\n", key, doc->seqnum);
+            fdb_doc_free(doc);
+            doc = NULL;
+
+            status = fdb_iterator_get(fit2, &doc);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            TEST_CMP(doc->key, key, doc->keylen);
+            TEST_CHK(doc->seqnum == static_cast<uint64_t>(i+1));
+            fdb_doc_free(doc);
+
+            i++;
+            status = fdb_iterator_next(fit);
+            TEST_CHK(status == fdb_iterator_next(fit2));
+        }
+        TEST_CHK(snap_seqnum == static_cast<uint64_t>(i));
+        num_read = snap_seqnum;
+
+        status = fdb_iterator_close(fit);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_iterator_close(fit2);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_close(snap_db);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_close(db);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_close(dbfile);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // shutdown
+    thread_exit(0);
+    return NULL;
+}
+
+void concurrent_writer_iterator_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, r;
+    int n = 100;
+    int num_threads = 1;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_status status;
+
+    char keybuf[16];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.compaction_threshold = 0;
+    fconfig.num_compactor_threads = 1;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE;
+
+    // open db
+    const char *test_filename = "./mvcc_test1";
+    status = fdb_open(&dbfile, test_filename, &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_open_default(dbfile, &db, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_set_log_callback(db, logCallbackFunc,
+                                  (void *) "concurrent_writer_iterator_test");
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    struct piterator_ctx ctx;
+    ctx.config = &fconfig;
+    ctx.num_docs = n;
+    ctx.filename = test_filename;
+
+    // Create parallel iterator threads
+    thread_t *tid = alca(thread_t, num_threads);
+    for (i = 0; i < num_threads; ++i) {
+        thread_create(&tid[i], parallel_iterator_thread, (void *)&ctx);
+    }
+
+    // insert each key and trigger a WAL_FLUSH
+    for (i=0;i<n;++i){
+        ctx.lock.lock();
+        sprintf(keybuf, "key%05d", i);
+        status = fdb_set_kv(db, keybuf, strlen(keybuf)+1, NULL, 0);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        ctx.lock.unlock();
+    }
+
+    for (i = 0; i < num_threads; ++i) {
+        void *thread_ret;
+        thread_join(tid[i], &thread_ret);
+    }
+
+    // close db file
+    status = fdb_close(dbfile);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // free all resources
+    status = fdb_shutdown();
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    memleak_end();
+
+    TEST_RESULT("concurrent writer and iterator consistency test");
+}
 
 void rollback_prior_to_ops(bool walflush)
 {
@@ -3223,6 +3900,7 @@ void rollback_prior_to_ops(bool walflush)
     (void)r;
 
     fconfig.wal_threshold = 1024;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 10;
     fconfig.purging_interval = 1; // retain deletes until compaction
@@ -3333,6 +4011,7 @@ struct cb_snapshot_args {
     fdb_kvs_handle *handle;
     int ndocs;
     int nupdates;
+    int niterations;
 };
 
 static void _snapshot_check(fdb_kvs_handle *handle, int ndocs, int nupdates)
@@ -3418,21 +4097,23 @@ static fdb_compact_decision cb_snapshot(fdb_file_handle *fhandle,
     struct cb_snapshot_args *args = (struct cb_snapshot_args *)ctx;
     TEST_INIT();
 
-    TEST_CHK(!kv_name);
-    if (status == FDB_CS_BEGIN) {
-        // first verification
-        _snapshot_check(args->handle, args->ndocs, args->nupdates);
-        // update half docs
-        _snapshot_update_docs(fhandle, args);
-        // second verification
-        _snapshot_check(args->handle, args->ndocs, args->nupdates);
-    } else { // if (status == FDB_CS_END)
-        // first verification
-        _snapshot_check(args->handle, args->ndocs, args->nupdates);
-        // update half docs
-        _snapshot_update_docs(fhandle, args);
-        // second verification
-        _snapshot_check(args->handle, args->ndocs, args->nupdates);
+    if (--args->niterations >= 0) {
+        TEST_CHK(!kv_name);
+        if (status == FDB_CS_BEGIN) {
+            // first verification
+            _snapshot_check(args->handle, args->ndocs, args->nupdates);
+            // update half docs
+            _snapshot_update_docs(fhandle, args);
+            // second verification
+            _snapshot_check(args->handle, args->ndocs, args->nupdates);
+        } else { // if (status == FDB_CS_END)
+            // first verification
+            _snapshot_check(args->handle, args->ndocs, args->nupdates);
+            // update half docs
+            _snapshot_update_docs(fhandle, args);
+            // second verification
+            _snapshot_check(args->handle, args->ndocs, args->nupdates);
+        }
     }
     return 0;
 }
@@ -3481,11 +4162,12 @@ void snapshot_concurrent_compaction_test()
         TEST_CHK(s == FDB_RESULT_SUCCESS);
         if ((i+1)%commit_term == 0) {
             s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
-	    TEST_CHK(s == FDB_RESULT_SUCCESS);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
         }
     }
     cb_args.ndocs = n;
     cb_args.nupdates = 2;
+    cb_args.niterations = 10;
 
     _snapshot_check(db, cb_args.ndocs, cb_args.nupdates);
 
@@ -3657,6 +4339,268 @@ void rollback_to_zero_test(bool multi_kv)
     TEST_RESULT(bodybuf);
 }
 
+void rollback_to_zero_after_compact_test(bool multi_kv)
+{
+    TEST_INIT();
+
+    int i, r;
+    const int n = 20;
+    int num_kvs = 4; // keep this the same as number of fdb_commit() calls
+    fdb_kvs_handle *db[4]; // same as num_kvs
+    fdb_file_handle *dbfile, *dbfile_comp;
+    fdb_doc *doc[n];
+    fdb_kvs_info info;
+    fdb_status status;
+
+    char keybuf[64], metabuf[64], bodybuf[64];
+    char kv_name[8];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+    fconfig.wal_threshold = 1024;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.compaction_threshold = 0;
+    fconfig.multi_kv_instances = multi_kv;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+
+    if (multi_kv) {
+        for (r = 0; r < num_kvs; ++r) {
+            sprintf(kv_name, "kv%d", r);
+            fdb_kvs_open(dbfile, &db[r], kv_name, &kvs_config);
+        }
+    } else {
+        num_kvs = 1;
+        fdb_kvs_open_default(dbfile, &db[0], &kvs_config);
+    }
+
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_set_log_callback(db[r], logCallbackFunc,
+                         (void *) "rollback_to_zero_after_compact_test");
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+   // ------- Setup test ----------------------------------
+   // insert documents of 0-4
+    for (i=0; i<n/4; i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[i]);
+        }
+    }
+
+    // commit with a manual WAL flush (these docs go into HB-trie)
+    fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+
+    // insert documents from 5 - 9
+    for (; i < n/2; i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[i]);
+        }
+    }
+
+    // commit again without a WAL flush
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    // insert documents from 10-14 into HB-trie
+    for (; i < (n/2 + n/4); i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[i]);
+        }
+    }
+    // manually flush WAL & commit
+    fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+
+    // insert documents from 15 - 19 on file into the WAL
+    for (; i < n; i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[i]);
+        }
+    }
+    // commit without a WAL flush
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    // open db
+    status = fdb_open(&dbfile_comp, "./mvcc_test1", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_compact(dbfile_comp, "./mvcc_test2");
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_close(dbfile_comp);
+
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_rollback(&db[r], 0);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_get_kvs_info(db[r], &info);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        TEST_CHK(info.last_seqnum == 0);
+        TEST_CHK(info.doc_count == 0);
+        TEST_CHK(info.space_used == 0);
+        status = fdb_get(db[r], doc[0]);
+        TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+        // test normal operation after rollback
+        status = fdb_set(db[r], doc[0]);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // test normal operation after rollbacks manually flush WAL & commit
+    status = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // close db file
+    fdb_close(dbfile);
+
+    // free all documents
+    for (i=0;i<n;++i){
+        fdb_doc_free(doc[i]);
+    }
+
+    // free all resources
+    fdb_shutdown();
+
+    sprintf(bodybuf, "rollback to zero after compact test %s",
+            multi_kv ? "multiple kv mode:" : "single kv mode:");
+    TEST_RESULT(bodybuf);
+}
+
+void rollback_to_wal_test(bool multi_kv)
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, r;
+    int n = 300;
+    int num_kvs = 1;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle **db = alca(fdb_kvs_handle *, num_kvs);
+    fdb_kvs_handle *snap_db;
+    fdb_doc **doc = alca(fdb_doc*, n);
+    fdb_doc *rdoc;
+    fdb_status status;
+
+    char keybuf[256], metabuf[256], bodybuf[256];
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+    fconfig.wal_threshold = 256;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.compaction_threshold = 0;
+    fconfig.multi_kv_instances = multi_kv;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test8", &fconfig);
+
+    fdb_kvs_open_default(dbfile, &db[0], &kvs_config);
+
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_set_log_callback(db[r], logCallbackFunc,
+                                      (void *) "rollback_to_wal_test");
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+   // ------- Setup test ----------------------------------
+    for (i=0; i<n; i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        fdb_set(db[0], doc[i]);
+    } // after 256 items wal gets flushed before commit
+
+    // commit normal but as wal was flushed, this will cause a wal flush again!
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    // update first half documents again
+    for (i = 0; i < n/2; i++){
+        fdb_doc_free(doc[i]);
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "META%d", i);
+        sprintf(bodybuf, "BODY%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        fdb_set(db[0], doc[i]);
+    }
+
+    // commit again, this time wal threshold not hit so no wal flush on commit
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    // update remaining half documents
+    for (; i < n; i++){
+        fdb_doc_free(doc[i]);
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "Meta%d", i);
+        sprintf(bodybuf, "Body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        fdb_set(db[0], doc[i]);
+    } // somewhere in this loop wal gets flushed before commit
+    // normal commit results in wal flush
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    status = fdb_rollback(&db[0], n + n/2);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    i = 1; // pick a document in the WAL section upon rollback
+    fdb_doc_create(&rdoc, doc[i]->key, doc[i]->keylen, NULL, 0, NULL, 0);
+    status = fdb_snapshot_open(db[0], &snap_db, n + n/2);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_get(snap_db, rdoc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    TEST_CMP(rdoc->body, doc[i]->body, rdoc->bodylen);
+    TEST_CHK(rdoc->seqnum == (fdb_seqnum_t)n + i + 1);
+    fdb_doc_free(rdoc);
+    fdb_kvs_close(snap_db);
+
+    // close db file
+    fdb_close(dbfile);
+
+    // free all documents
+    for (i=0;i<n;++i){
+        fdb_doc_free(doc[i]);
+    }
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    sprintf(bodybuf, "rollback to wal test %s", multi_kv ? "multiple kv mode:"
+                                                         : "single kv mode:");
+    TEST_RESULT(bodybuf);
+}
+
 void rollback_all_test(bool multi_kv)
 {
     TEST_INIT();
@@ -3689,6 +4633,7 @@ void rollback_all_test(bool multi_kv)
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
+    fconfig.block_reusing_threshold = 0;
 
     fdb_open(&dbfile, "./mvcc_test6", &fconfig);
     if (multi_kv) {
@@ -3769,9 +4714,9 @@ void rollback_all_test(bool multi_kv)
     status = fdb_get_all_snap_markers(dbfile, &markers, &num_markers);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     if (multi_kv) {
-        TEST_CHK(num_markers == 8);
+        TEST_CHK(num_markers == 9);
     } else {
-        TEST_CHK(num_markers == 4);
+        TEST_CHK(num_markers == 5);
     }
 
     // rollback to 15
@@ -3787,6 +4732,22 @@ void rollback_all_test(bool multi_kv)
         for (r = 0; r < num_kvs; ++r) {
             fdb_kvs_close(db[r]);
         }
+
+        fdb_file_handle *fhandle;
+        fdb_kvs_handle *dbhandle;
+        status = fdb_open(&fhandle, "./mvcc_test6", &fconfig);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_kvs_open(fhandle, &dbhandle, "kv0", &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        // Rollback again, but should fail again because there is a new handle created
+        status = fdb_rollback_all(dbfile, markers[i].marker);
+        TEST_CHK(status == FDB_RESULT_KV_STORE_BUSY);
+        // Close the handle to have the rollback pass
+        status = fdb_kvs_close(dbhandle);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        status = fdb_close(fhandle);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
         status = fdb_rollback_all(dbfile, markers[i].marker);
     }
 
@@ -3811,7 +4772,7 @@ void rollback_all_test(bool multi_kv)
         TEST_CHK(info.last_seqnum == rollback_seq);
         TEST_CHK(info.doc_count == rollback_seq);
         status = fdb_get(db[r], doc[n - 1]);
-        TEST_CHK(status = FDB_RESULT_KEY_NOT_FOUND);
+        TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
         status = fdb_get_kv(db[r], doc[0]->key, doc[0]->keylen,
                             (void **)&body, &bodylen);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -3887,6 +4848,7 @@ void auto_compaction_snapshots_test()
     // Open Database File
     config = fdb_get_default_config();
     config.compaction_mode = FDB_COMPACTION_AUTO;
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     config.compaction_cb = compaction_cb_count;
     config.compaction_cb_ctx = &num_compactions;
     config.compaction_cb_mask = FDB_CS_COMPLETE;
@@ -3922,7 +4884,7 @@ void auto_compaction_snapshots_test()
             // verify last doc set is captured in snapshot..
             fdb_doc_create(&rdoc, NULL, 0, NULL, 0, NULL, 0);
             rdoc->seqnum = seqnum;
-            status = fdb_get_byseq(kvs, rdoc);
+            status = fdb_get_byseq(snapshot, rdoc);
             TEST_CHK(status == FDB_RESULT_SUCCESS);
             TEST_CMP(rdoc->key, str, strlen(str));
             // free result document
@@ -3936,7 +4898,7 @@ void auto_compaction_snapshots_test()
             // verify last doc set is captured in snapshot..
             fdb_doc_create(&rdoc, NULL, 0, NULL, 0, NULL, 0);
             rdoc->seqnum = seqnum;
-            status = fdb_get_byseq(kvs, rdoc);
+            status = fdb_get_byseq(snapshot, rdoc);
             TEST_CHK(status == FDB_RESULT_SUCCESS);
             TEST_CMP(rdoc->key, str, strlen(str));
             // free result document
@@ -3986,6 +4948,8 @@ void *rollback_during_ops_test(void * args)
 
         // Open Database File
         config = fdb_get_default_config();
+        // disable block reusing for strict rollback
+        config.block_reusing_threshold = 0;
         status = fdb_open(&file, "mvcc_test1", &config);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
 
@@ -4065,6 +5029,8 @@ void *rollback_during_ops_test(void * args)
 
     // open new copy of dbfile and kvs
     config = fdb_get_default_config();
+    // disable block reusing for strict rollback
+    config.block_reusing_threshold = 0;
     status = fdb_open(&file, "mvcc_test1", &config);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     kvs_config = fdb_get_default_kvs_config();
@@ -4322,6 +5288,140 @@ void rollback_drop_multi_files_kvs_test()
     TEST_RESULT("open multi files kvs test");
 }
 
+void rollback_without_seqtree(bool multi_kv)
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, j, r;
+    int n = 10;
+    int num_commits = 5, num_kvs = 3;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle **db = alca(fdb_kvs_handle *, num_kvs);
+    fdb_doc **doc = alca(fdb_doc*, n);
+    fdb_status status;
+    fdb_snapshot_info_t *markers;
+    uint64_t num_markers;
+
+    char keybuf[256], metabuf[256], bodybuf[256];
+    char kv_name[8];
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.multi_kv_instances = multi_kv;
+    // for creating the strict number of snapshots, disable block reusing
+    fconfig.block_reusing_threshold = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_NOT_USE;
+
+    // remove previous mvcc_test files
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    fdb_open(&dbfile, "./mvcc_test1", &fconfig);
+    if (multi_kv) {
+        for (r = 0; r < num_kvs; ++r) {
+            sprintf(kv_name, "kv%d", r);
+            fdb_kvs_open(dbfile, &db[r], kv_name, &kvs_config);
+        }
+    } else {
+        num_kvs = 1;
+        fdb_kvs_open_default(dbfile, &db[0], &kvs_config);
+    }
+
+    // Load documents mulitple times
+    for (j=0; j < num_commits; ++j) {
+        for (i=0; i<n; i++){
+            sprintf(keybuf, "key%d", i);
+            sprintf(metabuf, "meta-%d-%d", j, i);
+            sprintf(bodybuf, "body-%d-%d", j, i);
+            fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+                           (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+            for (r = 0; r < num_kvs; ++r) {
+                fdb_set(db[r], doc[i]);
+            }
+            fdb_doc_free(doc[i]);
+        }
+        if (j % 2 == 0) {
+            fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        } else {
+            fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+        }
+    }
+
+    status = fdb_get_all_snap_markers(dbfile, &markers, &num_markers);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Rollback the first KV store to the second commit point
+    status = fdb_rollback(&db[0], markers[3].kvs_markers[0].seqnum);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_kvs_handle *snap_db;
+    fdb_iterator *iterator;
+    fdb_doc *rdoc = NULL;
+    // Create an in-memory snapshot for each KV store and verify all the keys.
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_snapshot_open(db[r], &snap_db, FDB_SNAPSHOT_INMEM);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        // Verify all the keys in the snapshot
+        status = fdb_iterator_init(snap_db, &iterator, NULL, 0, NULL, 0, FDB_ITR_NONE);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        i=0;
+        do {
+            status = fdb_iterator_get(iterator, &rdoc);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            sprintf(keybuf, "key%d", i);
+            if (r == 0) {
+                // The first KV store should only have KV items from the second commit.
+                sprintf(metabuf, "meta-1-%d", i);
+                sprintf(bodybuf, "body-1-%d", i);
+            } else {
+                sprintf(metabuf, "meta-%d-%d", num_commits - 1, i);
+                sprintf(bodybuf, "body-%d-%d", num_commits - 1, i);
+            }
+            TEST_CMP(rdoc->key, keybuf, rdoc->keylen);
+            TEST_CMP(rdoc->meta, metabuf, rdoc->metalen);
+            TEST_CMP(rdoc->body, bodybuf, rdoc->bodylen);
+            fdb_doc_free(rdoc);
+            rdoc = NULL;
+            i++;
+        } while (fdb_iterator_next(iterator) != FDB_RESULT_ITERATOR_FAIL);
+        TEST_CHK(i==n);
+        status = fdb_iterator_close(iterator);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        status = fdb_kvs_close(snap_db);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // Close all the KV store handles
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_kvs_close(db[r]);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+    // Rollback all the KV stores to the second commit point
+    status = fdb_rollback_all(dbfile, markers[3].marker);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_free_snap_markers(markers, num_markers);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // close db file
+    fdb_close(dbfile);
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    sprintf(bodybuf, "rollback without seqtree in %s",
+            multi_kv ? "multiple kv mode:" : "single kv mode:");
+    TEST_RESULT(bodybuf);
+}
+
 void tx_crash_recover_test()
 {
     TEST_INIT();
@@ -4429,9 +5529,78 @@ void tx_crash_recover_test()
 }
 
 
+void drop_kv_on_snap_iterator_test(){
+
+    TEST_INIT();
+    memleak_start();
+
+    int r;
+
+    fdb_status status;
+    fdb_file_handle *f1;
+    fdb_kvs_handle *kv, *kv2, *snap_kv;
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fdb_doc *rdoc = NULL;
+    fdb_iterator *iterator;
+
+    r = system(SHELL_DEL" mvcc_test* > errorlog.txt");
+    (void)r;
+
+    fdb_open(&f1, "./mvcc_test1", &fconfig);
+    fdb_kvs_open_default(f1, &kv2, &kvs_config);
+    fdb_kvs_open(f1, &kv, "kv", &kvs_config);
+
+    // write 2 seqno's
+    status = fdb_set_kv(kv, (void *) "a", 1, NULL, 0);
+    TEST_STATUS(status);
+    status = fdb_set_kv(kv, (void *) "b", 1, NULL, 0);
+    TEST_STATUS(status);
+    fdb_commit(f1, FDB_COMMIT_MANUAL_WAL_FLUSH);
+
+    // open snapshot
+    status = fdb_snapshot_open(kv, &snap_kv, 2);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // open iterator on snapshot
+    status = fdb_iterator_init(snap_kv, &iterator, NULL, 0, NULL, 0, FDB_ITR_NONE);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_close(snap_kv);
+    TEST_CHK(status != FDB_RESULT_SUCCESS);
+
+    // close kvs
+    status = fdb_kvs_close(kv);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // drop kvs
+    status = fdb_kvs_remove(f1, "kv");
+    TEST_CHK(status != FDB_RESULT_SUCCESS);
+
+    status = fdb_iterator_get(iterator, &rdoc);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    fdb_doc_free(rdoc);
+
+    status = fdb_iterator_close(iterator);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_close(snap_kv);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_kvs_close(kv2);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_close(f1);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    fdb_shutdown();
+
+    memleak_end();
+    TEST_RESULT("drop kv other handle test");
+}
 
 int main(){
 
+    concurrent_writer_iterator_test();
+    in_memory_snapshot_cleanup_test();
+    drop_kv_on_snap_iterator_test();
     rollback_secondary_kvs();
     multi_version_test();
 #ifdef __CRC32
@@ -4450,6 +5619,8 @@ int main(){
     snapshot_markers_in_file_test(true); // multi kv instance mode
     snapshot_markers_in_file_test(false); // single kv instance mode
     snapshot_with_deletes_test();
+    snapshot_without_seqtree(true); // multi kv instance mode
+    snapshot_without_seqtree(false); // single kv instance mode
     rollback_during_ops_test(NULL);
     rollback_forward_seqnum();
     rollback_test(false); // single kv instance mode
@@ -4458,14 +5629,22 @@ int main(){
     rollback_ncommits();
     transaction_test();
     transaction_simple_api_test();
+    transaction_in_memory_snapshot_test();
+    transaction_post_commit_snapshot_test();
     rollback_prior_to_ops(true); // wal commit
     rollback_prior_to_ops(false); // normal commit
     snapshot_concurrent_compaction_test();
     rollback_to_zero_test(true); // multi kv instance mode
     rollback_to_zero_test(false); // single kv instance mode
+    rollback_to_zero_after_compact_test(false); // single kv instance mode
+    rollback_to_zero_after_compact_test(true); // multi kv instance mode
     rollback_all_test(true); // multi kv instance mode
     rollback_all_test(false); // single kv instance mode
+    rollback_to_wal_test(true); // multi kv instance mode
+    rollback_to_wal_test(false); // single kv instance mode
     rollback_drop_multi_files_kvs_test();
+    rollback_without_seqtree(true); // multi kv instance mode
+    rollback_without_seqtree(false); // single kv instance mode
     tx_crash_recover_test();
     auto_compaction_snapshots_test(); // test snapshots with auto-compaction
 

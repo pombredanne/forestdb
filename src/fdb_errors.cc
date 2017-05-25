@@ -16,11 +16,18 @@
  */
 
 #include <stdlib.h>
+
 #include "libforestdb/forestdb.h"
+#include "fdb_engine.h"
 #include "fdb_internal.h"
 
 LIBFDB_API
 const char* fdb_error_msg(fdb_status err_code)
+{
+    return FdbEngine::getErrorMsg(err_code);
+}
+
+const char* FdbEngine::getErrorMsg(fdb_status err_code)
 {
     switch (err_code)
     {
@@ -159,6 +166,83 @@ const char* fdb_error_msg(fdb_status err_code)
 
         case FDB_RESULT_CRYPTO_ERROR:
             return "Encryption error";
+
+        case FDB_RESULT_COMPACTION_CANCELLATION:
+            return "Compaction canceled";
+
+        case FDB_RESULT_SB_INIT_FAIL:
+            return "Superblock initialization failed";
+
+        case FDB_RESULT_SB_RACE_CONDITION:
+            return "DB file is modified during superblock initialization";
+
+        case FDB_RESULT_SB_READ_FAIL:
+            return "Superblock is corrupted";
+
+        case FDB_RESULT_FILE_VERSION_NOT_SUPPORTED:
+            return "This version of DB file is not supported";
+
+
+        // All the error codes below correspond to errno values in Linux, OSX,
+        // and Windows, which can happen in file opeations.
+
+        case FDB_RESULT_EPERM:
+            return "A file operation is not permitted";
+        case FDB_RESULT_EIO:
+            return "A physical I/O error has occurred";
+        case FDB_RESULT_ENXIO:
+            return "No such device or address error";
+        case FDB_RESULT_EBADF:
+            return "Not a valid file descriptor";
+        case FDB_RESULT_ENOMEM:
+            return "Insufficient memory was available";
+        case FDB_RESULT_EACCESS:
+            return "File access permission was denied";
+        case FDB_RESULT_EFAULT:
+            return "Outside the process's accessible address space";
+        case FDB_RESULT_EEXIST:
+            return "A file name already exists in the file system";
+        case FDB_RESULT_ENODEV:
+            return "No corresponding device exists";
+        case FDB_RESULT_ENOTDIR:
+            return "A directory component in a file path name is not a directory";
+        case FDB_RESULT_EISDIR:
+            return "A file path name refers to a directory";
+        case FDB_RESULT_EINVAL:
+            return "Arguments to a file operation are not valid";
+        case FDB_RESULT_ENFILE:
+            return "The system-wide limit on the total number of open files has "
+                   "been reached";
+        case FDB_RESULT_EMFILE:
+            return "The per-process limit on the number of open file descriptors "
+                   "has been reached";
+        case FDB_RESULT_EFBIG:
+            return "A file is too large to be opened";
+        case FDB_RESULT_ENOSPC:
+            return "No space left on device";
+        case FDB_RESULT_EROFS:
+            return "A file on a read-only filesystem and write access was requested";
+        case FDB_RESULT_EOPNOTSUPP:
+            return "A file operation is not supported";
+        case FDB_RESULT_ENOBUFS:
+            return "Insufficient buffer space was available in the system to perform "
+                   "a operation";
+        case FDB_RESULT_ELOOP:
+            return "Too many symbolic links were encountered in resolving a file path name";
+        case FDB_RESULT_ENAMETOOLONG:
+            return "A file path name was too long";
+        case FDB_RESULT_EOVERFLOW:
+            return "A file is too large to be opened";
+        case FDB_RESULT_EAGAIN:
+            return "Resource temporarily unavailable";
+        case FDB_RESULT_CANCELLED:
+            return "Execution cancelled";
+        case FDB_RESULT_ENGINE_NOT_INSTANTIATED:
+            return "ForestDB engine not instantiated yet";
+        case FDB_RESULT_LOG_FILE_NOT_FOUND:
+            return "Log file not found";
+        case FDB_RESULT_LOCK_FAIL:
+            return "Unable to acquire/release lock";
 
         default:
             return "unknown error";

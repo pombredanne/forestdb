@@ -15,7 +15,6 @@
  *   limitations under the License.
  */
 
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -23,13 +22,20 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "filemgr.h"
 #include "filemgr_ops.h"
 
 #if !defined(WIN32) && !defined(_WIN32)
 
-int _filemgr_linux_open(const char *pathname, int flags, mode_t mode)
+fdb_fileops_handle _filemgr_linux_constructor(void *ctx) {
+    return fd_to_handle(-1);
+}
+
+fdb_status _filemgr_linux_open(const char *pathname,
+                               fdb_fileops_handle *fileops_handle,
+                               int flags, mode_t mode)
 {
     int fd;
     do {
@@ -37,44 +43,49 @@ int _filemgr_linux_open(const char *pathname, int flags, mode_t mode)
     } while (fd == -1 && errno == EINTR);
 
     if (fd < 0) {
-        if (errno == ENOENT) {
-            return (int) FDB_RESULT_NO_SUCH_FILE;
-        } else {
-            return (int) FDB_RESULT_OPEN_FAIL; // LCOV_EXCL_LINE
-        }
+        return (fdb_status) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                 FDB_RESULT_OPEN_FAIL);
     }
-    return fd;
+
+    *fileops_handle = fd_to_handle(fd);
+
+    return FDB_RESULT_SUCCESS;
 }
 
-ssize_t _filemgr_linux_pwrite(int fd, void *buf, size_t count, cs_off_t offset)
+ssize_t _filemgr_linux_pwrite(fdb_fileops_handle fileops_handle, void *buf,
+                              size_t count, cs_off_t offset)
 {
     ssize_t rv;
     do {
-        rv = pwrite(fd, buf, count, offset);
+        rv = pwrite(handle_to_fd(fileops_handle), buf, count, offset);
     } while (rv == -1 && errno == EINTR); // LCOV_EXCL_LINE
 
     if (rv < 0) {
-        return (ssize_t) FDB_RESULT_WRITE_FAIL; // LCOV_EXCL_LINE
+        return (ssize_t) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                     FDB_RESULT_WRITE_FAIL);
     }
     return rv;
 }
 
-ssize_t _filemgr_linux_pread(int fd, void *buf, size_t count, cs_off_t offset)
+ssize_t _filemgr_linux_pread(fdb_fileops_handle fileops_handle, void *buf, size_t count,
+                             cs_off_t offset)
 {
     ssize_t rv;
     do {
-        rv = pread(fd, buf, count, offset);
+        rv = pread(handle_to_fd(fileops_handle), buf, count, offset);
     } while (rv == -1 && errno == EINTR); // LCOV_EXCL_LINE
 
     if (rv < 0) {
-        return (ssize_t) FDB_RESULT_READ_FAIL; // LCOV_EXCL_LINE
+        return (ssize_t) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                     FDB_RESULT_READ_FAIL);
     }
     return rv;
 }
 
-int _filemgr_linux_close(int fd)
+int _filemgr_linux_close(fdb_fileops_handle fileops_handle)
 {
     int rv = 0;
+    int fd = handle_to_fd(fileops_handle);
     if (fd != -1) {
         do {
             rv = close(fd);
@@ -82,67 +93,74 @@ int _filemgr_linux_close(int fd)
     }
 
     if (rv < 0) {
-        return FDB_RESULT_CLOSE_FAIL; // LCOV_EXCL_LINE
+        return (int) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                 FDB_RESULT_CLOSE_FAIL);
     }
 
     return FDB_RESULT_SUCCESS;
 }
 
-cs_off_t _filemgr_linux_goto_eof(int fd)
+cs_off_t _filemgr_linux_goto_eof(fdb_fileops_handle fileops_handle)
 {
-    cs_off_t rv = lseek(fd, 0, SEEK_END);
+    cs_off_t rv = lseek(handle_to_fd(fileops_handle), 0, SEEK_END);
     if (rv < 0) {
-        return (cs_off_t) FDB_RESULT_SEEK_FAIL; // LCOV_EXCL_LINE
+        return (cs_off_t) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                      FDB_RESULT_SEEK_FAIL);
     }
     return rv;
 }
 
 // LCOV_EXCL_START
-cs_off_t _filemgr_linux_file_size(const char *filename)
+cs_off_t _filemgr_linux_file_size(fdb_fileops_handle fileops_handle,
+                                  const char *filename)
 {
     struct stat st;
     if (stat(filename, &st) == -1) {
-        return (cs_off_t) FDB_RESULT_READ_FAIL;
+        return (cs_off_t) convert_errno_to_fdb_status(errno,
+                                                      FDB_RESULT_READ_FAIL);
     }
     return st.st_size;
 }
 // LCOV_EXCL_STOP
 
-int _filemgr_linux_fsync(int fd)
+int _filemgr_linux_fsync(fdb_fileops_handle fileops_handle)
 {
     int rv;
     do {
-        rv = fsync(fd);
+        rv = fsync(handle_to_fd(fileops_handle));
     } while (rv == -1 && errno == EINTR); // LCOV_EXCL_LINE
 
     if (rv == -1) {
-        return FDB_RESULT_FSYNC_FAIL; // LCOV_EXCL_LINE
+        return (int) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                 FDB_RESULT_FSYNC_FAIL);
     }
 
     return FDB_RESULT_SUCCESS;
 }
 
 // LCOV_EXCL_START
-int _filemgr_linux_fdatasync(int fd)
+int _filemgr_linux_fdatasync(fdb_fileops_handle fileops_handle)
 {
 #if defined(__linux__) && !defined(__ANDROID__)
     int rv;
     do {
-        rv = fdatasync(fd);
+        rv = fdatasync(handle_to_fd(fileops_handle));
     } while (rv == -1 && errno == EINTR);
 
     if (rv == -1) {
-        return FDB_RESULT_FSYNC_FAIL;
+        return (int) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
+                                                 FDB_RESULT_FSYNC_FAIL);
     }
 
     return FDB_RESULT_SUCCESS;
 #else // __linux__ && not __ANDROID__
-    return _filemgr_linux_fsync(fd);
+    return _filemgr_linux_fsync(fileops_handle);
 #endif // __linux__ && not __ANDROID__
 }
 // LCOV_EXCL_STOP
 
-void _filemgr_linux_get_errno_str(char *buf, size_t size) {
+void _filemgr_linux_get_errno_str(fdb_fileops_handle fileops_handle, char *buf,
+                                  size_t size) {
     if (!buf) {
         return;
     } else {
@@ -157,7 +175,28 @@ void _filemgr_linux_get_errno_str(char *buf, size_t size) {
     }
 }
 
-int _filemgr_aio_init(struct async_io_handle *aio_handle)
+void *_filemgr_linux_mmap(fdb_fileops_handle fileops_handle, size_t length, void **aux)
+{
+    (void) aux;
+    void *addr = mmap(0, length, PROT_READ|PROT_WRITE, MAP_SHARED,
+                      handle_to_fd(fileops_handle), 0);
+    if (addr == MAP_FAILED) {
+        return NULL;
+    } else {
+        return addr;
+    }
+}
+
+int _filemgr_linux_munmap(fdb_fileops_handle fileops_handle,
+                          void *addr, size_t length, void *aux)
+{
+    (void) fileops_handle;
+    (void) aux;
+    return munmap(addr, length);
+}
+
+int _filemgr_aio_init(fdb_fileops_handle fileops_handle,
+                      struct async_io_handle *aio_handle)
 {
 #ifdef _ASYNC_IO
     if (!aio_handle) {
@@ -197,14 +236,15 @@ int _filemgr_aio_init(struct async_io_handle *aio_handle)
 #endif
 }
 
-int _filemgr_aio_prep_read(struct async_io_handle *aio_handle, size_t aio_idx,
+int _filemgr_aio_prep_read(fdb_fileops_handle fops_handle,
+                           struct async_io_handle *aio_handle, size_t aio_idx,
                            size_t read_size, uint64_t offset)
 {
 #ifdef _ASYNC_IO
     if (!aio_handle) {
         return FDB_RESULT_INVALID_ARGS;
     }
-    io_prep_pread(aio_handle->ioq[aio_idx], aio_handle->fd,
+    io_prep_pread(aio_handle->ioq[aio_idx], handle_to_fd(aio_handle->fops_handle),
                   aio_handle->aio_buf + (aio_idx * aio_handle->block_size),
                   aio_handle->block_size,
                   (offset / aio_handle->block_size) * aio_handle->block_size);
@@ -217,7 +257,8 @@ int _filemgr_aio_prep_read(struct async_io_handle *aio_handle, size_t aio_idx,
 #endif
 }
 
-int _filemgr_aio_submit(struct async_io_handle *aio_handle, int num_subs)
+int _filemgr_aio_submit(fdb_fileops_handle fops_handle,
+                        struct async_io_handle *aio_handle, int num_subs)
 {
 #ifdef _ASYNC_IO
     if (!aio_handle) {
@@ -233,7 +274,8 @@ int _filemgr_aio_submit(struct async_io_handle *aio_handle, int num_subs)
 #endif
 }
 
-int _filemgr_aio_getevents(struct async_io_handle *aio_handle, int min,
+int _filemgr_aio_getevents(fdb_fileops_handle fops_handle,
+                           struct async_io_handle *aio_handle, int min,
                            int max, unsigned int timeout)
 {
 #ifdef _ASYNC_IO
@@ -263,7 +305,8 @@ int _filemgr_aio_getevents(struct async_io_handle *aio_handle, int min,
 #endif
 }
 
-int _filemgr_aio_destroy(struct async_io_handle *aio_handle)
+int _filemgr_aio_destroy(fdb_fileops_handle fops_handle,
+                         struct async_io_handle *aio_handle)
 {
 #ifdef _ASYNC_IO
     if (!aio_handle) {
@@ -383,7 +426,7 @@ int _filemgr_linux_ext4_share_blks(int src_fd, int dst_fd, uint64_t src_off,
 }
 #endif
 
-int _filemgr_linux_get_fs_type(int src_fd)
+int _filemgr_linux_get_fs_type(fdb_fileops_handle src_fileops_handle)
 {
 #ifdef __sun
     // No support for ZFS
@@ -391,6 +434,7 @@ int _filemgr_linux_get_fs_type(int src_fd)
 #else
     int ret;
     struct statfs sfs;
+    int src_fd = handle_to_fd(src_fileops_handle);
     ret = fstatfs(src_fd, &sfs);
     if (ret != 0) {
         return FDB_RESULT_INVALID_ARGS;
@@ -415,10 +459,14 @@ int _filemgr_linux_get_fs_type(int src_fd)
 }
 
 int _filemgr_linux_copy_file_range(int fs_type,
-                                   int src_fd, int dst_fd, uint64_t src_off,
-                                   uint64_t dst_off, uint64_t len)
+                                   fdb_fileops_handle src_fileops_handle,
+                                   fdb_fileops_handle dst_fileops_handle,
+                                   uint64_t src_off, uint64_t dst_off,
+                                   uint64_t len)
 {
     int ret = (int)FDB_RESULT_INVALID_ARGS;
+    int src_fd = handle_to_fd(src_fileops_handle);
+    int dst_fd = handle_to_fd(dst_fileops_handle);
 #ifndef __sun
     if (fs_type == FILEMGR_FS_BTRFS) {
         struct btrfs_ioctl_clone_range_args cr_args;
@@ -440,7 +488,12 @@ int _filemgr_linux_copy_file_range(int fs_type,
     return ret;
 }
 
+void  _filemgr_linux_destructor(fdb_fileops_handle fileops_handle) {
+    (void)fileops_handle;
+}
+
 struct filemgr_ops linux_ops = {
+    _filemgr_linux_constructor,
     _filemgr_linux_open,
     _filemgr_linux_pwrite,
     _filemgr_linux_pread,
@@ -450,6 +503,8 @@ struct filemgr_ops linux_ops = {
     _filemgr_linux_fdatasync,
     _filemgr_linux_fsync,
     _filemgr_linux_get_errno_str,
+    _filemgr_linux_mmap,
+    _filemgr_linux_munmap,
     // Async I/O operations
     _filemgr_aio_init,
     _filemgr_aio_prep_read,
@@ -457,7 +512,9 @@ struct filemgr_ops linux_ops = {
     _filemgr_aio_getevents,
     _filemgr_aio_destroy,
     _filemgr_linux_get_fs_type,
-    _filemgr_linux_copy_file_range
+    _filemgr_linux_copy_file_range,
+    _filemgr_linux_destructor,
+    NULL
 };
 
 struct filemgr_ops * get_linux_filemgr_ops()

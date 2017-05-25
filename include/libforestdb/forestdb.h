@@ -479,16 +479,15 @@ fdb_status fdb_iterator_init(fdb_kvs_handle *handle,
  * @param max_seq Largest document sequence number of the iteration.
  *        Passing 0 means that it wants iteration to end with the latest
  *        mutation
- *
  * @param opt Iterator option.
  * @return FDB_RESULT_SUCCESS on success.
  */
 LIBFDB_API
 fdb_status fdb_iterator_sequence_init(fdb_kvs_handle *handle,
-                             fdb_iterator **iterator,
-                             const fdb_seqnum_t min_seq,
-                             const fdb_seqnum_t max_seq,
-                             fdb_iterator_opt_t opt);
+                                      fdb_iterator **iterator,
+                                      const fdb_seqnum_t min_seq,
+                                      const fdb_seqnum_t max_seq,
+                                      fdb_iterator_opt_t opt);
 
 /**
  * Move the iterator backward by one.
@@ -607,6 +606,25 @@ LIBFDB_API
 fdb_status fdb_iterator_close(fdb_iterator *iterator);
 
 /**
+ * Iterate through the changes since sequence number `since` with a provided
+ * callback function.
+ *
+ * @param handle Pointer to ForestDB KV store instance.
+ * @param since The sequence number to start iterating from.
+ * @param opt Iterator option.
+ * @param callback The callback function used to iterate over all changes.
+ * @param ctx Client context (passed to the callback).
+ * @return FDB_RESULT_SUCCESS on success, FDB_RESULT_CANCELLED if cancelled
+ *         by caller through callback.
+ */
+LIBFDB_API
+fdb_status fdb_changes_since(fdb_kvs_handle *handle,
+                             fdb_seqnum_t since,
+                             fdb_iterator_opt_t opt,
+                             fdb_changes_callback_fn callback,
+                             void *ctx);
+
+/**
  * Compact the current file and create a new compacted file.
  * Note that a new file name passed to this API will be ignored if the compaction
  * mode of the handle is auto-compaction (i.e., FDB_COMPACTION_AUTO). In the auto
@@ -716,6 +734,27 @@ LIBFDB_API
 fdb_status fdb_compact_upto_with_cow(fdb_file_handle *fhandle,
                                      const char *new_filename,
                                      fdb_snapshot_marker_t marker);
+
+/**
+ * Cancel the compaction task if it is running currently.
+ *
+ * @param fhandle Pointer to ForestDB file handle
+ * @return FDB_RESULT_SUCCESS on successful cancellation.
+ */
+LIBFDB_API
+fdb_status fdb_cancel_compaction(fdb_file_handle *fhandle);
+
+/**
+ * Set the daemon compaction interval for a given file.
+ *
+ * @param fhandle Pointer to ForestDB file handle.
+ * @param interval Daemon compaction intervel to be set for a given file
+ * @return FDB_RESULT_SUCCESS on successful compaction interval change.
+ */
+LIBFDB_API
+fdb_status fdb_set_daemon_compaction_interval(fdb_file_handle *fhandle,
+                                              size_t interval);
+
 /**
  * Change the database file's encryption, by compacting it while writing with a new key.
  * @param fhandle Pointer to ForestDB file handle.
@@ -797,7 +836,7 @@ fdb_status fdb_get_kvs_ops_info(fdb_kvs_handle *handle, fdb_kvs_ops_info *info);
 /**
  * Return the latency information about various forestdb api calls
  *
- * @param fhandle Pointer to ForestDB KV file handle
+ * @param fhandle Pointer to ForestDB file handle
  * @param stats Pointer to a latency_stats instance
  * @param type Type of latency stat to be retrieved
  * @return FDB_RESULT_SUCCESS on success.
@@ -806,6 +845,24 @@ LIBFDB_API
 fdb_status fdb_get_latency_stats(fdb_file_handle *fhandle,
                                  fdb_latency_stat *stats,
                                  fdb_latency_stat_type type);
+
+/**
+ * Returns a histogram of latencies for various forestdb api calls
+ * (Works with Couchbase Server Build only)
+ *
+ * @param fhandle Pointer to ForestDB file handle
+ * @param stats Char pointer to stats (need to be freed from heap
+ *              by client on SUCCESS)
+ * @param stats_length Pointer to the length of the buffer pointed to by the
+ *                     stats pointer
+ * @param type Type of latency stat to be retrieved
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status fdb_get_latency_histogram(fdb_file_handle *fhandle,
+                                     char **stats,
+                                     size_t *stats_length,
+                                     fdb_latency_stat_type type);
 
 /**
  * Return the name of the latency stat
@@ -852,6 +909,20 @@ LIBFDB_API
 fdb_status fdb_get_all_snap_markers(fdb_file_handle *fhandle,
                                     fdb_snapshot_info_t **markers,
                                     uint64_t *size);
+
+/**
+ * Returns the last available rollback sequence number for a given
+ * sequence number of a KV store.
+ *
+ * @param handle Pointer to ForestDB kvs handle.
+ * @param request_seqno Sequence number to rollback to.
+ * @return last available rollback sequence number.
+ *
+ */
+LIBFDB_API
+fdb_seqnum_t fdb_get_available_rollback_seq(fdb_kvs_handle *handle,
+                                            uint64_t request_seqno);
+
 /**
  * Free a kv snapshot_info array allocated by fdb_get_all_snap_markers API.
  *
@@ -1036,6 +1107,24 @@ fdb_status fdb_kvs_remove(fdb_file_handle *fhandle,
                           const char *kvs_name);
 
 /**
+ * Change the config parameters for reusing stale blocks
+ *
+ * @param fhandle Pointer to ForestDB file handle.
+ * @param block_reusing_threshold Circular block reusing threshold in the unit of
+ *        percentage(%), which can be represented as '(stale data size)/(total file size)
+ *        When stale data size grows beyond this threshold, circular block reusing is
+ *        triggered so that stale blocks are reused for further block allocations.
+ *        Block reusing is disabled if this threshold is set to zero or 100.
+ * @param num_keeping_headers Number of the last commit headers whose stale blocks should
+ *        be kept for snapshot readers
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status fdb_set_block_reusing_params(fdb_file_handle *fhandle,
+                                        size_t block_reusing_threshold,
+                                        size_t num_keeping_headers);
+
+/**
  * Retrieve ForestDB error code as a string
  *
  * @param  err_code Error code
@@ -1045,6 +1134,56 @@ fdb_status fdb_kvs_remove(fdb_file_handle *fhandle,
  */
 LIBFDB_API
 const char* fdb_error_msg(fdb_status err_code);
+
+/**
+ * Return the string representation of ForestDB library version that is based on
+ * git-describe output.
+ *
+ * @return A text string that represents ForestDB library version
+ */
+LIBFDB_API
+const char* fdb_get_lib_version();
+
+/**
+ * Return the version of a given ForestDB file.
+ *
+ * @param fhandle Pointer to ForestDB file handle whose file version is returned.
+ * @return Version of a given ForestDB file.
+ */
+LIBFDB_API
+const char* fdb_get_file_version(fdb_file_handle *fhandle);
+
+/**
+ * Return the default file operations used by ForestDB.
+ *
+ * @return pointer to the struct having all the default file operations
+ */
+LIBFDB_API
+fdb_filemgr_ops_t* fdb_get_default_file_ops();
+
+/**
+ * Fetch select stats for the ForestDB KV store handle.
+ *
+ * @param handle Pointer to ForestDB KV store instance
+ * @param callback Callback function that the caller will register, this callback
+ *                 function is invoked for every stat of the KV store handle
+ * @param ctx Client context that is passed to the callback
+ *
+ * Stats returned (File level)
+ *  1> Num_wal_shards               : Number of shards in the WAL
+ *  2> Num_bcache_shards            : Number of shards in FDB's global block cache
+ *  3> Block_cache_hits             : Number of block cache hits
+ *  4> Block_cache_misses           : Number of block cache misses
+ *  5> Block_cache_num_items        : Number of block cache items
+ *  6> Block_cache_num_victims      : Number of block cache victims (evictions)
+ *  7> Block_cache_num_immutables   : Number of block cache immutables (eligible for eviction)
+ *
+ */
+LIBFDB_API
+fdb_status fdb_fetch_handle_stats(fdb_kvs_handle *handle,
+                                  fdb_handle_stats_cb callback,
+                                  void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

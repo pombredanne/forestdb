@@ -15,36 +15,48 @@
  *   limitations under the License.
  */
 
-#ifndef _JSAHN_TIME_UTILS_H
-#define _JSAHN_TIME_UTILS_H
+#pragma once
 
-#include <time.h>
 #if defined(WIN32) || defined(_WIN32)
+#include <winsock2.h>
 #include <Windows.h>
 #else
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+#include <time.h>
+#include "stdint.h"
 
-#ifdef __cplusplus
-extern "C" {
+#ifndef hrtime_t
+#include <stdint.h>
+  typedef uint64_t hrtime_t;
+#endif //ifndef hrtime_t
+
+#ifndef _PLATFORM_LIB_AVAILABLE
+extern "C" hrtime_t gethrtime(void);
+extern "C" hrtime_t gethrtime_period(void);
 #endif
+
+typedef  long int ts_nsec;
+ts_nsec get_monotonic_ts();
+ts_nsec ts_diff(ts_nsec start, ts_nsec end);
 
 struct timeval _utime_gap(struct timeval a, struct timeval b);
+uint64_t timeval_to_us(struct timeval tv);
 
 #if defined(WIN32) || defined(_WIN32)
+#ifdef _PLATFORM_LIB_AVAILABLE
+#include <platform/platform.h>
+#else
+// If platform library has not been included, usleep
+// needs to be explicitly defined for windows.
 void usleep(unsigned int useconds);
-#endif
+#endif // _PLATFORM_LIB_AVAILABLE
+#endif // defined(WIN32) || defined(_WIN32)
 
 void decaying_usleep(unsigned int *sleep_time, unsigned int max_sleep_time);
 
 #if !defined(WIN32) && !defined(_WIN32)
 struct timespec convert_reltime_to_abstime(unsigned int ms);
-#endif
-
-#ifdef __cplusplus
-}
-#endif
-
 #endif
 

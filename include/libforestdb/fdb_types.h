@@ -18,8 +18,11 @@
 #ifndef _FDB_TYPES_H
 #define _FDB_TYPES_H
 
+#include "fdb_errors.h"
+
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
 #ifndef _MSC_VER
 #include <stdbool.h>
 #else
@@ -229,12 +232,12 @@ typedef struct fdb_doc_struct {
 /**
  * Opaque reference to a ForestDB file handle, which is exposed in public APIs.
  */
-typedef struct _fdb_file_handle fdb_file_handle;
+typedef struct FdbFileHandle fdb_file_handle;
 
 /**
  * Opaque reference to a ForestDB KV store handle, which is exposed in public APIs.
  */
-typedef struct _fdb_kvs_handle fdb_kvs_handle;
+typedef struct FdbKvsHandle fdb_kvs_handle;
 
 /**
  * Compaction status for callback function.
@@ -289,6 +292,103 @@ typedef struct {
     fdb_encryption_algorithm_t algorithm;
     uint8_t bytes[32];
 } fdb_encryption_key;
+
+/**
+ * Using off_t turned out to be a real challenge. On "unix-like" systems
+ * its size is set by a combination of #defines like: _LARGE_FILE,
+ * _FILE_OFFSET_BITS and/or _LARGEFILE_SOURCE etc. The interesting
+ * part is however Windows.
+ *
+ * Windows follows the LLP64 data model:
+ * http://en.wikipedia.org/wiki/LLP64#64-bit_data_models
+ *
+ * This means both the int and long int types have a size of 32 bits
+ * regardless if it's a 32 or 64 bits Windows system.
+ *
+ * And Windows defines the type off_t as being a signed long integer:
+ * http://msdn.microsoft.com/en-us/library/323b6b3k.aspx
+ *
+ * This means we can't use off_t on Windows if we deal with files
+ * that can have a size of 2Gb or more.
+ */
+typedef int64_t cs_off_t;
+
+struct async_io_handle;
+
+/**
+ * An opaque structure that is passed to the filemgr_ops.
+ * The structure will possess all the context that an external
+ * client requires for performing custom operations in their
+ * respective callbacks
+ */
+typedef struct fdb_fileops_handle_opaque* fdb_fileops_handle;
+
+#ifdef _MSC_VER
+    typedef unsigned long mode_t;
+    #include <BaseTsd.h>
+#ifdef _PLATFORM_LIB_AVAILABLE
+    typedef long fdb_ssize_t;
+#else
+    typedef SSIZE_T fdb_ssize_t;
+#endif // _PLATFORM_LIB_AVAILABLE
+#else
+    typedef ssize_t fdb_ssize_t;
+#endif
+
+typedef void* voidref;
+/**
+ * This structure can be used to perform custom operations by
+ * the external client before performing a file operation on
+ * a forestdb file.
+ *
+ * An example usage of the open API is given below
+ *
+ * fdb_status client_open(const char* pathname, fdb_fileops_handle* fops_handle,
+ *                        int flags, mode_t mode) {
+ *     ClientObject* clObj = reinterpret_cast<ClientObject *>(*fops_handle);
+ *     return clObj->original_fdb_ops->open(pathname,
+ *                                          &clObj->original_fdb_handle,
+ *                                          flags, mode);
+ * }
+ */
+typedef struct filemgr_ops {
+    fdb_fileops_handle (*constructor)(void *ctx);
+    fdb_status (*open)(const char *pathname, fdb_fileops_handle *fops_handle,
+                       int flags, mode_t mode);
+    fdb_ssize_t (*pwrite)(fdb_fileops_handle fops_handle, void *buf, size_t count,
+                          cs_off_t offset);
+    fdb_ssize_t (*pread)(fdb_fileops_handle fops_handle, void *buf, size_t count,
+                         cs_off_t offset);
+    int (*close)(fdb_fileops_handle fops_handle);
+    cs_off_t (*goto_eof)(fdb_fileops_handle fops_handle);
+    cs_off_t (*file_size)(fdb_fileops_handle fops_handle,
+                          const char *filename);
+    int (*fdatasync)(fdb_fileops_handle fops_handle);
+    int (*fsync)(fdb_fileops_handle fops_handle);
+    void (*get_errno_str)(fdb_fileops_handle fops_handle, char *buf, size_t size);
+    voidref (*mmap)(fdb_fileops_handle fops_handle, size_t length, void **aux);
+    int (*munmap)(fdb_fileops_handle fops_handle, void *addr, size_t length, void *aux);
+
+    // Async I/O operations
+    int (*aio_init)(fdb_fileops_handle fops_handle, struct async_io_handle *aio_handle);
+    int (*aio_prep_read)(fdb_fileops_handle fops_handle,
+                         struct async_io_handle *aio_handle, size_t aio_idx,
+                         size_t read_size, uint64_t offset);
+    int (*aio_submit)(fdb_fileops_handle fops_handle,
+                      struct async_io_handle *aio_handle, int num_subs);
+    int (*aio_getevents)(fdb_fileops_handle fops_handle,
+                         struct async_io_handle *aio_handle, int min,
+                         int max, unsigned int timeout);
+    int (*aio_destroy)(fdb_fileops_handle fops_handle,
+                       struct async_io_handle *aio_handle);
+
+    int (*get_fs_type)(fdb_fileops_handle src_fd);
+    int (*copy_file_range)(int fs_type, fdb_fileops_handle src_fops_handle,
+                           fdb_fileops_handle dst_fops_handle, uint64_t src_off,
+                           uint64_t dst_off, uint64_t len);
+    void (*destructor)(fdb_fileops_handle fops_handle);
+    void *ctx;
+} fdb_filemgr_ops_t;
 
 /**
  * ForestDB config options that are passed to fdb_open API.
@@ -386,8 +486,10 @@ typedef struct {
      */
     uint64_t compaction_minimum_filesize;
     /**
-     * Duration that the compaction daemon periodically wakes up, in the unit of
-     * second. This is a global config that is used across all ForestDB files.
+     * Duration that the compaction daemon task periodically wakes up, in the unit of
+     * second. This is a local config that can be configured per file.
+     * If the daemon compaction interval for a given file needs to be adjusted, then
+     * fdb_set_daemon_compaction_interval API can be used.
      */
     uint64_t compactor_sleep_duration;
     /**
@@ -461,6 +563,36 @@ typedef struct {
      * must be given, otherwise fdb_open will fail with error FDB_RESULT_NO_DB_HEADERS.
      */
     fdb_encryption_key encryption_key;
+    /**
+     * Circular block reusing threshold in the unit of percentage (%), which can be
+     * represented as '(stale data size)/(total file size)'. When stale data size
+     * grows beyond the threshold, circular block reusing is triggered so that stale
+     * blocks are reused for further block allocation. Block reusing is disabled if
+     * this threshold is set to zero or 100.
+     */
+    size_t block_reusing_threshold;
+    /**
+     * Number of the last commit headers whose stale blocks should be kept for
+     * snapshot readers.
+     */
+    size_t num_keeping_headers;
+    /**
+     * Breakpad crash catcher settings
+     */
+    const char* breakpad_minidump_dir;
+    /**
+     * Custom file operations
+     */
+    fdb_filemgr_ops_t* custom_file_ops;
+    /**
+     * Number of global background I/O threads used across all forestdb instances
+     * Default value is 50% the number of cores
+     */
+    size_t num_background_threads;
+    /**
+     * Flush limit in bytes for non-block aligned buffer cache
+     */
+    size_t bcache_flush_limit;
 
 } fdb_config;
 
@@ -509,7 +641,11 @@ enum {
     /**
      * The highest key specified will not be returned by the iterator.
      */
-    FDB_ITR_SKIP_MAX_KEY = 0x08
+    FDB_ITR_SKIP_MAX_KEY = 0x08,
+    /**
+     * Return Keys and Metadata only for fdb_changes_since API.
+     */
+    FDB_ITR_NO_VALUES = 0x10
 };
 
 /**
@@ -531,7 +667,44 @@ enum {
  * Opaque reference to ForestDB iterator structure definition, which is exposed
  * in public APIs.
  */
-typedef struct _fdb_iterator fdb_iterator;
+typedef struct FdbIterator fdb_iterator;
+
+/**
+ * Return type for the fdb_changes_since API's callback: fdb_changes_function_fn
+ */
+typedef int fdb_changes_decision;
+enum {
+    /**
+     * This return value means that the fdb_doc instance passed to the callback
+     * function will not to be freed in the fdb_changes_since API, the caller
+     * would have to take care of it.
+     */
+    FDB_CHANGES_PRESERVE = 1,
+    /**
+     * This return value means that the fdb_doc instance passed to the callback
+     * function will automatically be freed in the fdb_changes_since API.
+     */
+    FDB_CHANGES_CLEAN = 0,
+    /**
+     * This return value means that the fdb_doc instance passed to the callback
+     * function will automatically be freed in the fdb_changes_since API and
+     * the iteration within the API will be stopped.
+     */
+    FDB_CHANGES_CANCEL = -1
+};
+
+/**
+ * The callback function used by fdb_changes_since() to iterate through
+ * the documents.
+ *
+ * @param handle Pointer to ForestDB KV store instance
+ * @param doc Pointer to the current document
+ * @param ctx Client context
+ */
+typedef fdb_changes_decision (*fdb_changes_callback_fn)(
+                                                 fdb_kvs_handle *handle,
+                                                 fdb_doc *doc,
+                                                 void *ctx);
 
 /**
  * Using off_t turned out to be a real challenge. On "unix-like" systems
@@ -656,15 +829,32 @@ typedef struct {
  */
 typedef uint8_t fdb_latency_stat_type;
 enum {
-    FDB_LATENCY_SETS      = 0, // fdb_set API
-    FDB_LATENCY_GETS      = 1, // fdb_get API
-    FDB_LATENCY_COMMITS   = 2, // fdb_commit API
-    FDB_LATENCY_SNAPSHOTS = 3, // fdb_snapshot_open API
-    FDB_LATENCY_COMPACTS  = 4  // fdb_compact API
+    FDB_LATENCY_SETS         = 0, // fdb_set API
+    FDB_LATENCY_GETS         = 1, // fdb_get API
+    FDB_LATENCY_COMMITS      = 2, // fdb_commit API
+    FDB_LATENCY_SNAP_INMEM   = 3, // fdb_snapshot_open in-memory API
+    FDB_LATENCY_SNAP_DUR     = 4, // fdb_snapshot_open durable API
+    FDB_LATENCY_COMPACTS     = 5, // fdb_compact API
+    FDB_LATENCY_ITR_INIT     = 6, // fdb_iterator_init API
+    FDB_LATENCY_ITR_SEQ_INIT = 7, // fdb_iterator_sequence_init API
+    FDB_LATENCY_ITR_NEXT     = 8, // fdb_iterator_next API
+    FDB_LATENCY_ITR_PREV     = 9, // fdb_iterator_prev API
+    FDB_LATENCY_ITR_GET      = 10, // fdb_iterator_get API
+    FDB_LATENCY_ITR_GET_META = 11, // fdb_iterator_get_metaonly API
+    FDB_LATENCY_ITR_SEEK     = 12, // fdb_iterator_seek API
+    FDB_LATENCY_ITR_SEEK_MAX = 13, // fdb_iterator_seek_to_max API
+    FDB_LATENCY_ITR_SEEK_MIN = 14, // fdb_iterator_seek_to_min API
+    FDB_LATENCY_ITR_CLOSE    = 15, // fdb_iterator_close API
+    FDB_LATENCY_OPEN         = 16, // fdb_open API
+    FDB_LATENCY_KVS_OPEN     = 17, // fdb_kvs_open API
+    FDB_LATENCY_SNAP_CLONE   = 18, // fdb_snapshot_open from another snapshot
+    FDB_LATENCY_WAL_INS      = 19, // wal_insert()
+    FDB_LATENCY_WAL_FIND     = 20, // wal_find()
+    FDB_LATENCY_WAL_COMMIT   = 21, // wal_commit()
+    FDB_LATENCY_WAL_FLUSH    = 22, // _wal_flush()
+    FDB_LATENCY_WAL_RELEASE  = 23, // wal_release_flushed_items()
+    FDB_LATENCY_NUM_STATS    = 24  // Number of stats (keep as highest elem)
 };
-
-// Number of latency stat types
-#define FDB_LATENCY_NUM_STATS 5
 
 /**
  * Latency statistics of a specific ForestDB api call
@@ -741,6 +931,20 @@ typedef struct {
      */
     fdb_kvs_commit_marker_t *kvs_markers;
 } fdb_snapshot_info_t;
+
+/**
+ * The callback function is used by fdb_fetch_handle_stats.
+ *
+ * @param handle Pointer to ForestDB KV store instance
+ * @param stat stat name
+ * @param value stat value
+ * @param ctx Client context
+ */
+typedef void (*fdb_handle_stats_cb)(fdb_kvs_handle *handle,
+                                    const char *stat,
+                                    uint64_t value,
+                                    void *ctx);
+
 
 #ifdef __cplusplus
 }

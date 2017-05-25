@@ -83,8 +83,9 @@ void multi_kv_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 50;
     config.buffercache_size = 0;
@@ -148,6 +149,15 @@ void multi_kv_test(uint8_t opt, size_t chunksize)
     }
     s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // info check
+    s = fdb_get_file_info(dbfile, &file_info);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    TEST_CHK(file_info.doc_count == (uint64_t)n);
+    TEST_CHK(file_info.num_kv_stores == 1);
+    s = fdb_get_kvs_info(db, &kvs_info);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    TEST_CHK(kvs_info.doc_count == (uint64_t)n);
 
     kvs_config.create_if_missing = false;
     s = fdb_kvs_open(dbfile, &kv1, "kv1", &kvs_config);
@@ -398,7 +408,28 @@ void multi_kv_test(uint8_t opt, size_t chunksize)
     // must fail due to opened handle
     TEST_CHK(s != FDB_RESULT_SUCCESS);
 
-    // closing super handle also closes all other sub-handles;
+    // Close "kv1" handle
+    s = fdb_kvs_close(kv1);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    // re-open with a new file handle
+    fdb_file_handle *fhandle;
+    if (opt & MULTI_KV_VAR_CMP) {
+        s = fdb_open_custom_cmp(&fhandle, "./multi_kv_test2", &config,
+                                2, kvs_names, functions);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    } else {
+        s = fdb_open(&fhandle, "./multi_kv_test2", &config);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+    s = fdb_kvs_open(fhandle, &kv1, "kv1", &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    // Try to remove "kv1" again, but should fail
+    s = fdb_kvs_remove(dbfile, "kv1");
+    TEST_CHK(s == FDB_RESULT_KV_STORE_BUSY);
+
+    // closing super handles also closes all other sub-handles;
+    s = fdb_close(fhandle);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
     s = fdb_close(dbfile);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
 
@@ -491,8 +522,9 @@ void multi_kv_iterator_key_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 1000;
     config.buffercache_size = 0;
@@ -678,8 +710,9 @@ void multi_kv_iterator_seq_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 1000;
     config.buffercache_size = 0;
@@ -762,21 +795,23 @@ void multi_kv_iterator_seq_test(uint8_t opt, size_t chunksize)
     s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
 
-    // iterate in default KV instance
-    i = 1;
-    s = fdb_iterator_sequence_init(db, &it, 0, 0, FDB_ITR_NONE);
-    TEST_CHK(s == FDB_RESULT_SUCCESS);
-    while (fdb_iterator_next(it) == FDB_RESULT_SUCCESS) {
-        i++;
-    }
-    TEST_CHK(i == n);
-    fdb_iterator_close(it);
-
     // pre-allocate memory and re-use it for the iterator return document
     s = fdb_doc_create(&doc, NULL, 0, NULL, 0, NULL, 0);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
     doc->key = &keyBuf[0];
     doc->body = &valueBuf[0];
+
+    // iterate in default KV instance
+    i = 1;
+    s = fdb_iterator_sequence_init(db, &it, 0, 0, FDB_ITR_NONE);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    while (fdb_iterator_next(it) == FDB_RESULT_SUCCESS) {
+        s = fdb_iterator_get(it, &doc);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        i++;
+    }
+    TEST_CHK(i == n);
+    fdb_iterator_close(it);
 
     // iterate in KV1
     i = 0;
@@ -867,7 +902,7 @@ void multi_kv_iterator_seq_test(uint8_t opt, size_t chunksize)
         (void)seqnum;
         i++;
     } while (fdb_iterator_next(it) == FDB_RESULT_SUCCESS);
-    TEST_CHK(i == 46);
+    TEST_CHK(i == 71);
     fdb_iterator_close(it);
 
     s = fdb_kvs_close(kv1);
@@ -924,8 +959,9 @@ void multi_kv_txn_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 1000;
     config.buffercache_size = 0;
@@ -1297,8 +1333,9 @@ void multi_kv_snapshot_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 1000;
     config.buffercache_size = 0;
@@ -1477,11 +1514,14 @@ void multi_kv_rollback_test(uint8_t opt, size_t chunksize)
     memleak_start();
 
     config = fdb_get_default_config();
-    config.chunksize = chunksize;
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
+    config.chunksize = chunksize;
     config.multi_kv_instances = true;
     config.wal_threshold = 1000;
     config.buffercache_size = 0;
+    // for rollback, disable block reusing
+    config.block_reusing_threshold = 0;
 
     if (opt & MULTI_KV_VAR_CMP) {
         s = fdb_open_custom_cmp(&dbfile, "./multi_kv_test", &config,
@@ -1775,6 +1815,7 @@ void multi_kv_custom_cmp_test()
 
     config = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     config.multi_kv_instances = true;
     config.wal_threshold = 256;
     config.wal_flush_before_commit = false;
@@ -2068,6 +2109,7 @@ void multi_kv_fdb_open_custom_cmp_test()
 
     config = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     config.multi_kv_instances = true;
     config.wal_threshold = 256;
     config.wal_flush_before_commit = false;
@@ -2195,6 +2237,7 @@ void multi_kv_use_existing_mode_test()
 
     config = fdb_get_default_config();
     kvs_config = fdb_get_default_kvs_config();
+    config.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     config.wal_threshold = 256;
     config.buffercache_size = 0;
 
@@ -2291,6 +2334,73 @@ void multi_kv_use_existing_mode_test()
     TEST_RESULT("multiple KV instances use existing mode test");
 }
 
+void *_opening_thread(void *args) {
+    int nhandles = 100;
+    fdb_file_handle **dbfile = alca(fdb_file_handle *, nhandles);
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_status s;
+    TEST_INIT();
+
+    for (int i = 0; i < nhandles; ++i) {
+        s = fdb_open(&dbfile[i], "multi_kv_test2", &fconfig);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+    for (int i = 0; i < nhandles; ++i) {
+        s = fdb_close(dbfile[i]);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+    thread_exit(0);
+    return NULL;
+}
+
+void multi_kv_open_test()
+{
+    TEST_INIT();
+    memleak_start();
+
+    int n = 256;
+    int nthreads = 7;
+    thread_t *tid = alca(thread_t, nthreads);
+    fdb_file_handle *dbfile;
+    fdb_status status;
+    fdb_config fconfig;
+    fdb_kvs_config kvs_config;
+
+    // remove previous multi_kv_test files
+    int r = system(SHELL_DEL" multi_kv_test* > errorlog.txt");
+    (void)r;
+
+    fconfig = fdb_get_default_config();
+    kvs_config = fdb_get_default_kvs_config();
+
+    // open db
+    status = fdb_open(&dbfile, "multi_kv_test2", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    for (int i = 0; i < nthreads; ++i) {
+        thread_create(&tid[i], _opening_thread, NULL);
+    }
+    for (int i = 0; i < n; ++i) {
+        fdb_kvs_handle *db;
+        char kvname[8];
+        sprintf(kvname, "kv_%d", i);
+        status = fdb_kvs_open(dbfile, &db, kvname, &kvs_config);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    for (int i = 0; i < nthreads; ++i) {
+        void *thread_ret;
+        thread_join(tid[i], &thread_ret);
+    }
+
+    status = fdb_close(dbfile);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_shutdown();
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    memleak_end();
+    TEST_RESULT("multi KV creation with parallel open");
+}
 void multi_kv_close_test()
 {
     TEST_INIT();
@@ -2314,6 +2424,7 @@ void multi_kv_close_test()
 
     fconfig = fdb_get_default_config();
     fconfig.buffercache_size = 0;
+    fconfig.seqtree_opt = FDB_SEQTREE_USE; // enable seqtree since get_byseq
     fconfig.wal_threshold = 8;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.purging_interval = 0;
@@ -2401,6 +2512,7 @@ int main(){
     uint8_t opt;
     size_t chunksize;
 
+    multi_kv_open_test();
     for (j=0;j<3;++j) {
         if (j==0) {
             chunksize = 8;

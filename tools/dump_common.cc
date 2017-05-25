@@ -53,20 +53,23 @@ void print_header(fdb_kvs_handle *db)
 
     printf("DB header info:\n");
 
-    filemgr_get_header(db->file, header_buf, &header_len, NULL, NULL, NULL);
-    version = db->file->version;
+    db->file->getHeader(header_buf, &header_len, NULL, NULL, NULL);
+    version = db->file->getVersion();
     if (header_len > 0) {
         fdb_fetch_header(version, header_buf, &trie_root_bid, &seq_root_bid,
                          &stale_root_bid, &ndocs, &ndeletes, &nlivenodes,
                          &datasize, &last_header_bid, &kv_info_offset,
                          &header_flags, &compacted_filename, &prev_filename);
-        revnum = filemgr_get_header_revnum(db->file);
+        revnum = db->file->getHeaderRevnum();
 
-        bid = filemgr_get_header_bid(db->file);
+        bid = db->file->getHeaderBid();
         printf("    BID: %" _F64 " (0x%" _X64 ", byte offset: %" _F64 ")\n",
                bid, bid, bid * FDB_BLOCKSIZE);
         printf("    DB header length: %d bytes\n", (int)header_len);
         printf("    DB header revision number: %d\n", (int)revnum);
+        printf("    DB file version: %s\n", fdb_get_file_version(db->fhandle));
+
+        struct btreeblk_subblocks *subblock = db->bhandle->getSubblockArray();
 
         if (trie_root_bid != BLK_NOT_FOUND) {
             if (!is_subblock(trie_root_bid)) {
@@ -77,9 +80,9 @@ void print_header(fdb_kvs_handle *db)
                 // sub-block
                 subbid2bid(trie_root_bid, &subblock_no, &idx, &bid);
                 printf("    HB+trie root BID: %" _F64 ", %d-byte subblock #%" _F64,
-                       bid, db->bhandle->sb[subblock_no].sb_size, (uint64_t) idx);
+                       bid, subblock[subblock_no].sb_size, (uint64_t) idx);
                 printf(" (0x%" _X64 ", byte offset: %" _F64 ")\n", trie_root_bid,
-                       bid * FDB_BLOCKSIZE + db->bhandle->sb[subblock_no].sb_size * idx);
+                       bid * FDB_BLOCKSIZE + subblock[subblock_no].sb_size * idx);
             }
         } else {
             printf("    HB+trie root BID: not exist\n");
@@ -94,9 +97,9 @@ void print_header(fdb_kvs_handle *db)
                 // sub-block
                 subbid2bid(seq_root_bid, &subblock_no, &idx, &bid);
                 printf("    Seq B+tree root BID: %" _F64 ", %d-byte subblock #%" _F64,
-                       bid, db->bhandle->sb[subblock_no].sb_size, (uint64_t) idx);
+                       bid, subblock[subblock_no].sb_size, (uint64_t) idx);
                 printf(" (0x%" _X64 ", byte offset: %" _F64 ")\n", seq_root_bid,
-                       bid * FDB_BLOCKSIZE + db->bhandle->sb[subblock_no].sb_size * idx);
+                       bid * FDB_BLOCKSIZE + subblock[subblock_no].sb_size * idx);
             }
         } else {
             printf("    Seq B+tree root BID: not exist\n");
@@ -111,9 +114,9 @@ void print_header(fdb_kvs_handle *db)
                 // sub-block
                 subbid2bid(stale_root_bid, &subblock_no, &idx, &bid);
                 printf("    Stale B+tree root BID: %" _F64 ", %d-byte subblock #%" _F64,
-                       bid, db->bhandle->sb[subblock_no].sb_size, (uint64_t) idx);
+                       bid, subblock[subblock_no].sb_size, (uint64_t) idx);
                 printf(" (0x%" _X64 ", byte offset: %" _F64 ")\n", stale_root_bid,
-                       bid * FDB_BLOCKSIZE + db->bhandle->sb[subblock_no].sb_size * idx);
+                       bid * FDB_BLOCKSIZE + subblock[subblock_no].sb_size * idx);
             }
         } else {
             printf("    Stale B+tree root BID: not exist\n");
@@ -134,13 +137,13 @@ void print_header(fdb_kvs_handle *db)
             struct kvs_node *node, query;
             struct avl_node *a;
 
-            ndocs = _kvs_stat_get_sum(db->file, KVS_STAT_NDOCS);
-            ndeletes = _kvs_stat_get_sum(db->file, KVS_STAT_NDELETES);
-            nlivenodes = _kvs_stat_get_sum(db->file, KVS_STAT_NLIVENODES);
-            ndocs_wal_inserted = wal_get_size(db->file);
-            ndocs_wal_deleted = wal_get_num_deletes(db->file);
-            datasize = _kvs_stat_get_sum(db->file, KVS_STAT_DATASIZE);
-            datasize_wal = wal_get_datasize(db->file);
+            ndocs = db->file->getKvsStatOps()->statGetSum(KVS_STAT_NDOCS);
+            ndeletes = db->file->getKvsStatOps()->statGetSum(KVS_STAT_NDELETES);
+            nlivenodes = db->file->getKvsStatOps()->statGetSum(KVS_STAT_NLIVENODES);
+            ndocs_wal_inserted = db->file->getWal()->getSize_Wal();
+            ndocs_wal_deleted = db->file->getWal()->getNumDeletes_Wal();
+            datasize = db->file->getKvsStatOps()->statGetSum(KVS_STAT_DATASIZE);
+            datasize_wal = db->file->getWal()->getDataSize_Wal();
 
             printf("    # documents in the main index: %" _F64
                    ", %" _F64 "deleted / "
@@ -158,7 +161,7 @@ void print_header(fdb_kvs_handle *db)
             for (i=0; i<name_list.num_kvs_names; ++i){
                 if (strcmp(name_list.kvs_names[i], DEFAULT_KVS_NAME)) {
                     query.kvs_name = name_list.kvs_names[i];
-                    a = avl_search(db->file->kv_header->idx_name,
+                    a = avl_search(db->file->getKVHeader_UNLOCKED()->idx_name,
                                    &query.avl_name,
                                    _kvs_cmp_name_fdb_dump);
                     if (!a) {
@@ -176,14 +179,14 @@ void print_header(fdb_kvs_handle *db)
                     datasize = node->stat.datasize;
                 } else { // default KVS
                     printf("      KV store name: %s\n", name_list.kvs_names[i]);
-                    ndocs = db->file->header.stat.ndocs;
-                    ndeletes = db->file->header.stat.ndeletes;
-                    nlivenodes = db->file->header.stat.nlivenodes;
-                    seqnum = db->file->header.seqnum;
-                    ndocs_wal_inserted = db->file->header.stat.wal_ndocs -
-                                         db->file->header.stat.wal_ndeletes;
-                    ndocs_wal_deleted = db->file->header.stat.wal_ndeletes;
-                    datasize = db->file->header.stat.datasize;
+                    ndocs = db->file->accessHeader()->stat.ndocs;
+                    ndeletes = db->file->accessHeader()->stat.ndeletes;
+                    nlivenodes = db->file->accessHeader()->stat.nlivenodes;
+                    seqnum = db->file->accessHeader()->seqnum;
+                    ndocs_wal_inserted = db->file->accessHeader()->stat.wal_ndocs -
+                                         db->file->accessHeader()->stat.wal_ndeletes;
+                    ndocs_wal_deleted = db->file->accessHeader()->stat.wal_ndeletes;
+                    datasize = db->file->accessHeader()->stat.datasize;
                 }
 
                 printf("      # documents in the main index: %" _F64
@@ -201,10 +204,10 @@ void print_header(fdb_kvs_handle *db)
 
         } else {
             // single KV instance mode
-            seqnum = filemgr_get_seqnum(db->file);
-            ndocs_wal_inserted = wal_get_size(db->file);
-            ndocs_wal_deleted = wal_get_num_deletes(db->file);
-            datasize_wal = wal_get_datasize(db->file);
+            seqnum = db->file->getSeqnum();
+            ndocs_wal_inserted = db->file->getWal()->getSize_Wal();
+            ndocs_wal_deleted = db->file->getWal()->getNumDeletes_Wal();
+            datasize_wal = db->file->getWal()->getDataSize_Wal();
 
             printf("    # documents in the main index: %" _F64
             ", %" _F64 "deleted / "
@@ -228,5 +231,6 @@ void print_header(fdb_kvs_handle *db)
 
     } else {
         printf("    No header exists.\n");
+        printf("    DB file version: %s\n", fdb_get_file_version(db->fhandle));
     }
 }

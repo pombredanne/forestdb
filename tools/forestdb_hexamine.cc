@@ -189,25 +189,27 @@ int process_file(struct input_option *opt)
 {
     fdb_file_handle *dbfile = NULL;
     fdb_config config;
+    fdb_fileops_handle fileops_handle;
     char *filename = opt->filename;
     uint64_t file_size;
     size_t num_blocks;
-    struct filemgr file;
+    FileMgr file;
     uint8_t block_buf[BLK_SIZE];
     fdb_status fs;
 
     config = fdb_get_default_config();
     config.buffercache_size = 0;
     config.flags = FDB_OPEN_FLAG_RDONLY;
-    file.ops = get_filemgr_ops();
-    file.fd = file.ops->open(filename, O_RDWR, 0666);
+    file.setOps(get_filemgr_ops());
+    fs = FileMgr::fileOpen(filename, file.getOps(), &fileops_handle,
+                           O_RDWR, 0666);
 
-    if (file.fd < 0) {
+    if (fs != FDB_RESULT_SUCCESS) {
         printf("\nUnable to open %s\n", filename);
         return -1;
     }
 
-    file_size = file.ops->file_size(filename);
+    file_size = file.getOps()->file_size(fileops_handle, filename);
     num_blocks = file_size / BLK_SIZE;
 
     if (opt->print_header) {
@@ -216,12 +218,29 @@ int process_file(struct input_option *opt)
             printf("\nUnable to open %s\n", filename);
             return -1;
         }
-        print_header(dbfile->root);
+        print_header(dbfile->getRootHandle());
+        fdb_snapshot_info_t *markers;
+        uint64_t num_markers;
+        fs = fdb_get_all_snap_markers(dbfile, &markers, &num_markers);
+        if (fs != FDB_RESULT_SUCCESS) {
+            printf("\nNo commit headers found in file %s\n", filename);
+            return -2;
+        }
+        for (uint64_t i = 0; i < num_markers; ++i) {
+            printf("DB Header at bid %" _F64 ": with %" _F64 " kv stores\n",
+                markers[i].marker, markers[i].num_kvs_markers);
+            for (int64_t j = 0; j < markers[i].num_kvs_markers; ++j) {
+                printf("\t KVS %s at seqnum %" _F64 "\n",
+                    markers[i].kvs_markers[j].kv_store_name,
+                    markers[i].kvs_markers[j].seqnum);
+            }
+        }
+        fdb_free_snap_markers(markers, num_markers);
     }
     if (opt->headers_only) {
         for (uint64_t i = 0; i < num_blocks; ++i) {
-            ssize_t rv = file.ops->pread(file.fd, &block_buf, BLK_SIZE,
-                                          i * BLK_SIZE);
+            ssize_t rv = file.getOps()->pread(fileops_handle, &block_buf, BLK_SIZE,
+                                             i * BLK_SIZE);
             if (rv != BLK_SIZE) {
                 fdb_close(dbfile);
                 return FDB_RESULT_READ_FAIL;
@@ -278,8 +297,8 @@ int process_file(struct input_option *opt)
             return -1;
         }
         for (uint64_t i = 0; i < num_blocks; ++i) {
-            ssize_t rv = file.ops->pread(file.fd, &db[i], BLK_SIZE,
-                    i * BLK_SIZE);
+            ssize_t rv = file.getOps()->pread(fileops_handle, &db[i], BLK_SIZE,
+                                              i * BLK_SIZE);
             if (rv != BLK_SIZE) {
                 if (opt->print_header) {
                     fdb_close(dbfile);
@@ -309,8 +328,7 @@ int process_file(struct input_option *opt)
         }
     }
 
-    file.ops->close(file.fd);
-
+    FileMgr::fileClose(file.getOps(), fileops_handle);
     return -1;
 }
 

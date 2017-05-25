@@ -47,31 +47,18 @@
 #endif
 #endif
 
-// variables for initialization
-volatile uint8_t bgflusher_initialized = 0;
-static mutex_t bgf_lock;
-
-static size_t num_bgflusher_threads = DEFAULT_NUM_BGFLUSHER_THREADS;
-static thread_t *bgflusher_tids = NULL;
-
-static size_t sleep_duration = FDB_BGFLUSHER_SLEEP_DURATION;
-
-static mutex_t sync_mutex;
-static thread_cond_t sync_cond;
-
-static volatile uint8_t bgflusher_terminate_signal = 0;
-
-static struct avl_tree openfiles;
-
 struct openfiles_elem {
     char filename[FDB_MAX_FILENAME_LEN];
-    struct filemgr *file;
+    FileMgr *file;
     fdb_config config;
     uint32_t register_count;
     bool background_flush_in_progress;
-    err_log_callback *log_callback;
+    ErrLogCallback *log_callback;
     struct avl_node avl;
 };
+
+std::atomic<BgFlusher *> BgFlusher::bgflusherInstance(nullptr);
+std::mutex BgFlusher::bgfLock;
 
 // compares file names
 static int _bgflusher_cmp(struct avl_node *a, struct avl_node *b, void *aux)
@@ -82,26 +69,32 @@ static int _bgflusher_cmp(struct avl_node *a, struct avl_node *b, void *aux)
     return strncmp(aa->filename, bb->filename, FDB_MAX_FILENAME_LEN);
 }
 
-static void * bgflusher_thread(void *voidargs)
+void *bgflusher_thread(void *voidargs) {
+    BgFlusher *bgf = BgFlusher::getBgfInstance();
+    fdb_assert(bgf, bgf, NULL);
+    return bgf->bgflusherThread();
+}
+
+void * BgFlusher::bgflusherThread()
 {
     fdb_status fs;
     struct avl_node *a;
-    struct filemgr *file;
+    FileMgr *file;
     struct openfiles_elem *elem;
-    err_log_callback *log_callback = NULL;
+    ErrLogCallback *log_callback = NULL;
 
     while (1) {
         uint64_t num_blocks = 0;
 
-        mutex_lock(&bgf_lock);
-        a = avl_first(&openfiles);
+        UniqueLock l_lock(bgfLock);
+        a = avl_first(&openFiles);
         while(a) {
             filemgr_open_result ffs;
             elem = _get_entry(a, struct openfiles_elem, avl);
             file = elem->file;
             if (!file) {
                 a = avl_next(a);
-                avl_remove(&openfiles, &elem->avl);
+                avl_remove(&openFiles, &elem->avl);
                 free(elem);
                 continue;
             }
@@ -111,121 +104,145 @@ static void * bgflusher_thread(void *voidargs)
             } else {
                 elem->background_flush_in_progress = true;
                 log_callback = elem->log_callback;
-                ffs = filemgr_open(file->filename, file->ops,
-                        file->config, log_callback);
+                ffs = FileMgr::open(file->getFileName(), file->getOps(),
+                                    file->getConfig(), log_callback);
                 fs = (fdb_status)ffs.rv;
-                mutex_unlock(&bgf_lock);
+                l_lock.unlock();
                 if (fs == FDB_RESULT_SUCCESS) {
-                    num_blocks += filemgr_flush_immutable(file,
-                                                          log_callback);
-                    filemgr_close(file, 0, file->filename, log_callback);
+                    num_blocks += file->flushImmutable(log_callback);
+                    FileMgr::close(file, false, file->getFileName(), log_callback);
 
                 } else {
                     fdb_log(log_callback, fs,
                             "Failed to open the file '%s' for background flushing\n.",
-                            file->filename);
+                            file->getFileName());
                 }
-                mutex_lock(&bgf_lock);
+                l_lock.lock();
                 elem->background_flush_in_progress = false;
                 a = avl_next(&elem->avl);
-                if (bgflusher_terminate_signal) {
-                    mutex_unlock(&bgf_lock);
+                if (bgflusherTerminateSignal) {
                     return NULL;
                 }
             }
         }
-        mutex_unlock(&bgf_lock);
+        l_lock.unlock();
 
-        mutex_lock(&sync_mutex);
-        if (bgflusher_terminate_signal) {
-            mutex_unlock(&sync_mutex);
+        mutex_lock(&syncMutex);
+        if (bgflusherTerminateSignal) {
+            mutex_unlock(&syncMutex);
             break;
         }
         if (!num_blocks) {
-            thread_cond_timedwait(&sync_cond, &sync_mutex,
-                                  (unsigned)(sleep_duration * 1000));
+            thread_cond_timedwait(&syncCond, &syncMutex,
+                                  (unsigned)(bgFlusherSleepInSecs * 1000));
         }
-        if (bgflusher_terminate_signal) {
-            mutex_unlock(&sync_mutex);
+        if (bgflusherTerminateSignal) {
+            mutex_unlock(&syncMutex);
             break;
         }
-        mutex_unlock(&sync_mutex);
+        mutex_unlock(&syncMutex);
     }
     return NULL;
 }
 
-void bgflusher_init(struct bgflusher_config *config)
+BgFlusher * BgFlusher::createBgFlusher(struct bgflusher_config *config)
 {
-    if (!bgflusher_initialized) {
-        // Note that this function is synchronized by spin lock in fdb_init API.
-        mutex_init(&bgf_lock);
-
-        mutex_lock(&bgf_lock);
-        if (!bgflusher_initialized) {
-            // initialize
-            avl_init(&openfiles, NULL);
-
-            bgflusher_terminate_signal = 0;
-
-            mutex_init(&sync_mutex);
-            thread_cond_init(&sync_cond);
-
-            // create worker threads
-            num_bgflusher_threads = config->num_threads;
-            bgflusher_tids = (thread_t *) calloc(num_bgflusher_threads,
-                                                 sizeof(thread_t));
-            for (size_t i = 0; i < num_bgflusher_threads; ++i) {
-                thread_create(&bgflusher_tids[i], bgflusher_thread, NULL);
+    BgFlusher *tmp = bgflusherInstance.load();
+    if (tmp == nullptr) {
+        LockHolder l_lock(bgfLock);
+        tmp = bgflusherInstance.load();
+        if (tmp == nullptr) {
+            tmp = new BgFlusher(config->num_threads);
+            bgflusherInstance.store(tmp);
+            // We must create threads only after the singleton instance is ready
+            for (size_t i = 0; i < config->num_threads; ++i) {
+                thread_create(&tmp->bgflusherThreadIds[i], bgflusher_thread,
+                              NULL);
             }
-
-            bgflusher_initialized = 1;
         }
-        mutex_unlock(&bgf_lock);
+    }
+    return tmp;
+}
+
+BgFlusher::BgFlusher(size_t num_threads) {
+    // Note that this function is synchronized by spin lock in fdb_init API.
+    // initialize
+    avl_init(&openFiles, NULL);
+
+    bgflusherTerminateSignal = 0;
+
+    mutex_init(&syncMutex);
+    thread_cond_init(&syncCond);
+
+    // create worker threads
+    numBgFlusherThreads = num_threads;
+    bgFlusherSleepInSecs = FDB_BGFLUSHER_SLEEP_DURATION;
+
+    bgflusherThreadIds = (thread_t *) calloc(numBgFlusherThreads,
+                                         sizeof(thread_t));
+}
+
+BgFlusher *BgFlusher::getBgfInstance() {
+    BgFlusher *bgf = bgflusherInstance.load();
+    if (bgf == nullptr) {
+        struct bgflusher_config default_config;
+        default_config.num_threads = DEFAULT_NUM_BGFLUSHER_THREADS;
+        return createBgFlusher(&default_config);
+    }
+    return bgf;
+}
+
+void BgFlusher::destroyBgFlusher() {
+    LockHolder l_lock(bgfLock);
+    BgFlusher *tmp  = bgflusherInstance.load();
+    if (tmp != nullptr) {
+        delete tmp;
+        bgflusherInstance = nullptr;
     }
 }
 
-void bgflusher_shutdown()
+BgFlusher::~BgFlusher()
 {
     void *ret;
     struct avl_node *a = NULL;
     struct openfiles_elem *elem;
 
-    // set terminate signal
-    mutex_lock(&sync_mutex);
-    bgflusher_terminate_signal = 1;
-    thread_cond_broadcast(&sync_cond);
-    mutex_unlock(&sync_mutex);
-
-    for (size_t i = 0; i < num_bgflusher_threads; ++i) {
-        thread_join(bgflusher_tids[i], &ret);
+    if (!bgflusherThreadIds) {
+        return;
     }
-    free(bgflusher_tids);
 
-    mutex_lock(&bgf_lock);
+    // set terminate signal
+    mutex_lock(&syncMutex);
+    bgflusherTerminateSignal = 1;
+    thread_cond_broadcast(&syncCond);
+    mutex_unlock(&syncMutex);
+
+    for (size_t i = 0; i < numBgFlusherThreads; ++i) {
+        thread_join(bgflusherThreadIds[i], &ret);
+    }
+    free(bgflusherThreadIds);
+    bgflusherThreadIds = NULL;
+
     // free all elems in the tree
-    a = avl_first(&openfiles);
+    a = avl_first(&openFiles);
     while (a) {
         elem = _get_entry(a, struct openfiles_elem, avl);
         a = avl_next(a);
 
-        avl_remove(&openfiles, &elem->avl);
+        avl_remove(&openFiles, &elem->avl);
         free(elem);
     }
 
-    sleep_duration = FDB_BGFLUSHER_SLEEP_DURATION;
-    bgflusher_initialized = 0;
-    mutex_destroy(&sync_mutex);
-    thread_cond_destroy(&sync_cond);
-    mutex_unlock(&bgf_lock);
-
-    mutex_destroy(&bgf_lock);
+    bgFlusherSleepInSecs = FDB_BGFLUSHER_SLEEP_DURATION;
+    mutex_destroy(&syncMutex);
+    thread_cond_destroy(&syncCond);
 }
 
-fdb_status bgflusher_register_file(struct filemgr *file,
-                                   fdb_config *config,
-                                   err_log_callback *log_callback)
+fdb_status BgFlusher::registerFile_BgFlusher(FileMgr *file,
+                                             fdb_config *config,
+                                             ErrLogCallback *log_callback)
 {
-    file_status_t fstatus;
+    file_status_t fMgrStatus;
     fdb_status fs = FDB_RESULT_SUCCESS;
     struct avl_node *a = NULL;
     struct openfiles_elem query, *elem;
@@ -233,27 +250,27 @@ fdb_status bgflusher_register_file(struct filemgr *file,
     // Ignore files whose status is FILE_COMPACT_OLD to prevent
     // reinserting of files undergoing compaction if it is in the catchup phase
     // Also ignore files whose status is REMOVED_PENDING.
-    fstatus = filemgr_get_file_status(file);
-    if (fstatus == FILE_COMPACT_OLD ||
-        fstatus == FILE_REMOVED_PENDING) {
+    fMgrStatus = file->getFileStatus();
+    if (fMgrStatus == FILE_COMPACT_OLD ||
+        fMgrStatus == FILE_REMOVED_PENDING) {
         return fs;
     }
 
-    strcpy(query.filename, file->filename);
+    strcpy(query.filename, file->getFileName());
     // first search the existing file
-    mutex_lock(&bgf_lock);
-    a = avl_search(&openfiles, &query.avl, _bgflusher_cmp);
+    LockHolder l_lock(bgfLock);
+    a = avl_search(&openFiles, &query.avl, _bgflusher_cmp);
     if (a == NULL) {
         // doesn't exist
         // create elem and insert into tree
         elem = (struct openfiles_elem *)calloc(1, sizeof(struct openfiles_elem));
         elem->file = file;
-        strcpy(elem->filename, file->filename);
+        strcpy(elem->filename, file->getFileName());
         elem->config = *config;
         elem->register_count = 1;
         elem->background_flush_in_progress = false;
         elem->log_callback = log_callback;
-        avl_insert(&openfiles, &elem->avl, _bgflusher_cmp);
+        avl_insert(&openFiles, &elem->avl, _bgflusher_cmp);
     } else {
         // already exists
         elem = _get_entry(a, struct openfiles_elem, avl);
@@ -263,41 +280,38 @@ fdb_status bgflusher_register_file(struct filemgr *file,
         elem->register_count++;
         elem->log_callback = log_callback; // use the latest
     }
-    mutex_unlock(&bgf_lock);
     return fs;
 }
 
-void bgflusher_switch_file(struct filemgr *old_file, struct filemgr *new_file,
-                           err_log_callback *log_callback)
+void BgFlusher::switchFile_BgFlusher(FileMgr *old_file,
+                                     FileMgr *new_file,
+                                     ErrLogCallback *log_callback)
 {
     struct avl_node *a = NULL;
     struct openfiles_elem query, *elem;
 
-    strcpy(query.filename, old_file->filename);
-    mutex_lock(&bgf_lock);
-    a = avl_search(&openfiles, &query.avl, _bgflusher_cmp);
+    strcpy(query.filename, old_file->getFileName());
+    LockHolder l_lock(bgfLock);
+    a = avl_search(&openFiles, &query.avl, _bgflusher_cmp);
     if (a) {
         elem = _get_entry(a, struct openfiles_elem, avl);
-        avl_remove(&openfiles, a);
-        strcpy(elem->filename, new_file->filename);
+        avl_remove(&openFiles, a);
+        strcpy(elem->filename, new_file->getFileName());
         elem->file = new_file;
         elem->register_count = 1;
         elem->background_flush_in_progress = false;
-        avl_insert(&openfiles, &elem->avl, _bgflusher_cmp);
-        mutex_unlock(&bgf_lock);
-    } else {
-        mutex_unlock(&bgf_lock);
+        avl_insert(&openFiles, &elem->avl, _bgflusher_cmp);
     }
 }
 
-void bgflusher_deregister_file(struct filemgr *file)
+void BgFlusher::deregisterFile_BgFlusher(FileMgr *file)
 {
     struct avl_node *a = NULL;
     struct openfiles_elem query, *elem;
 
-    strcpy(query.filename, file->filename);
-    mutex_lock(&bgf_lock);
-    a = avl_search(&openfiles, &query.avl, _bgflusher_cmp);
+    strcpy(query.filename, file->getFileName());
+    LockHolder l_lock(bgfLock);
+    a = avl_search(&openFiles, &query.avl, _bgflusher_cmp);
     if (a) {
         elem = _get_entry(a, struct openfiles_elem, avl);
         if ((--elem->register_count) == 0) {
@@ -310,10 +324,9 @@ void bgflusher_deregister_file(struct filemgr *file)
                 elem->file = NULL;
             } else {
                 // remove from the tree
-                avl_remove(&openfiles, &elem->avl);
+                avl_remove(&openFiles, &elem->avl);
                 free(elem);
             }
         }
     }
-    mutex_unlock(&bgf_lock);
 }

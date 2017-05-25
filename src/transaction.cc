@@ -20,7 +20,9 @@
 #include <stdint.h>
 
 #include "libforestdb/forestdb.h"
+#include "fdb_engine.h"
 #include "fdb_internal.h"
+#include "file_handle.h"
 #include "internal_types.h"
 #include "filemgr.h"
 #include "common.h"
@@ -28,47 +30,150 @@
 #include "wal.h"
 #include "memleak.h"
 
+// Global static variables
+static std::atomic<uint64_t> transaction_id(0); // unique & monotonically increasing
+
 LIBFDB_API
 fdb_status fdb_begin_transaction(fdb_file_handle *fhandle,
                                  fdb_isolation_level_t isolation_level)
 {
+    FdbEngine *fdb_engine = FdbEngine::getInstance();
+    if (fdb_engine) {
+        return fdb_engine->beginTransaction(fhandle, isolation_level);
+    }
+    return FDB_RESULT_ENGINE_NOT_INSTANTIATED;
+}
+
+LIBFDB_API
+fdb_status fdb_abort_transaction(fdb_file_handle *fhandle)
+{
+    FdbEngine *fdb_engine = FdbEngine::getInstance();
+    if (fdb_engine) {
+        return fdb_engine->abortTransaction(fhandle);
+    }
+    return FDB_RESULT_ENGINE_NOT_INSTANTIATED;
+}
+
+fdb_status FdbEngine::abortTransaction(FdbFileHandle *fhandle)
+{
+    if (!fhandle || !fhandle->getRootHandle()) {
+        return FDB_RESULT_INVALID_HANDLE;
+    }
+
+    FdbKvsHandle *handle = fhandle->getRootHandle();
     file_status_t fstatus;
-    fdb_kvs_handle *handle = fhandle->root;
-    struct filemgr *file;
+    FileMgr *file;
+    fdb_status status = FDB_RESULT_SUCCESS;
+
+    if (handle->txn == NULL) {
+        // there is no transaction started
+        return FDB_RESULT_TRANSACTION_FAIL;
+    }
+    if (handle->kvs) {
+        if (handle->kvs->getKvsType() == KVS_SUB) {
+            // deny transaction on sub handle
+            return FDB_RESULT_INVALID_HANDLE;
+        }
+    }
+
+    if (!BEGIN_HANDLE_BUSY(handle)) {
+        return FDB_RESULT_HANDLE_BUSY;
+    }
+
+    do { // repeat until file status is not REMOVED_PENDING
+        status = fdb_check_file_reopen(handle, NULL);
+        if (status != FDB_RESULT_SUCCESS) {
+            END_HANDLE_BUSY(handle);
+            return status;
+        }
+
+        file = handle->file;
+        file->mutexLock();
+        fdb_sync_db_header(handle);
+
+        fstatus = file->getFileStatus();
+        if (fstatus == FILE_REMOVED_PENDING) {
+            // we must not abort transaction on this file
+            // file status was changed by other thread .. start over
+            file->mutexUnlock();
+        }
+    } while (fstatus == FILE_REMOVED_PENDING);
+
+    file->getWal()->discardTxnEntries_Wal(handle->txn);
+    file->getWal()->removeTransaction_Wal(handle->txn);
+
+    free(handle->txn->items);
+    free(handle->txn->wrapper);
+    free(handle->txn);
+    handle->txn = NULL;
+
+    file->mutexUnlock();
+
+    END_HANDLE_BUSY(handle);
+    return status;
+}
+
+LIBFDB_API
+fdb_status fdb_end_transaction(fdb_file_handle *fhandle,
+                               fdb_commit_opt_t opt)
+{
+    FdbEngine *fdb_engine = FdbEngine::getInstance();
+    if (fdb_engine) {
+        return fdb_engine->endTransaction(fhandle, opt);
+    }
+    return FDB_RESULT_ENGINE_NOT_INSTANTIATED;
+}
+
+fdb_status FdbEngine::beginTransaction(FdbFileHandle *fhandle,
+                                       fdb_isolation_level_t isolation_level)
+{
+    if (!fhandle || !fhandle->getRootHandle()) {
+        return FDB_RESULT_INVALID_HANDLE;
+    }
+
+    file_status_t fstatus;
+    FdbKvsHandle *handle = fhandle->getRootHandle();
+    FileMgr *file;
+    fdb_status status = FDB_RESULT_SUCCESS;
 
     if (handle->txn) {
         // transaction already exists
         return FDB_RESULT_TRANSACTION_FAIL;
     }
     if (handle->kvs) {
-        if (handle->kvs->type == KVS_SUB) {
+        if (handle->kvs->getKvsType() == KVS_SUB) {
             // deny transaction on sub handle
             return FDB_RESULT_INVALID_HANDLE;
         }
     }
 
-    if (!atomic_cas_uint8_t(&handle->handle_busy, 0, 1)) {
+    if (!BEGIN_HANDLE_BUSY(handle)) {
         return FDB_RESULT_HANDLE_BUSY;
     }
 
     do { // repeat until file status is not REMOVED_PENDING
-        fdb_check_file_reopen(handle, NULL);
-        filemgr_mutex_lock(handle->file);
-        fdb_sync_db_header(handle);
-
-        if (filemgr_is_rollback_on(handle->file)) {
-            // deny beginning transaction during rollback
-            filemgr_mutex_unlock(handle->file);
-            atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
-            return FDB_RESULT_FAIL_BY_ROLLBACK;
+        status = fdb_check_file_reopen(handle, NULL);
+        if (status != FDB_RESULT_SUCCESS) {
+            END_HANDLE_BUSY(handle);
+            return status;
         }
 
         file = handle->file;
-        fstatus = filemgr_get_file_status(file);
+        file->mutexLock();
+        fdb_sync_db_header(handle);
+
+        if (file->isRollbackOn()) {
+            // deny beginning transaction during rollback
+            file->mutexUnlock();
+            END_HANDLE_BUSY(handle);
+            return FDB_RESULT_FAIL_BY_ROLLBACK;
+        }
+
+        fstatus = file->getFileStatus();
         if (fstatus == FILE_REMOVED_PENDING) {
             // we must not create transaction on this file
             // file status was changed by other thread .. start over
-            filemgr_mutex_unlock(file);
+            file->mutexUnlock();
         }
     } while (fstatus == FILE_REMOVED_PENDING);
 
@@ -77,7 +182,8 @@ fdb_status fdb_begin_transaction(fdb_file_handle *fhandle,
                            malloc(sizeof(struct wal_txn_wrapper));
     handle->txn->wrapper->txn = handle->txn;
     handle->txn->handle = handle;
-    if (filemgr_get_file_status(handle->file) != FILE_COMPACT_OLD) {
+    handle->txn->txn_id = ++transaction_id;
+    if (file->getFileStatus() != FILE_COMPACT_OLD) {
         // keep previous header's BID
         handle->txn->prev_hdr_bid = handle->last_hdr_bid;
     } else {
@@ -86,128 +192,75 @@ fdb_status fdb_begin_transaction(fdb_file_handle *fhandle,
         // there is no previous header until the compaction is done.
         handle->txn->prev_hdr_bid = BLK_NOT_FOUND;
     }
+    handle->txn->prev_revnum = handle->cur_header_revnum;
     handle->txn->items = (struct list *)malloc(sizeof(struct list));
     handle->txn->isolation = isolation_level;
     list_init(handle->txn->items);
-    wal_add_transaction(file, handle->txn);
+    file->getWal()->addTransaction_Wal(handle->txn);
 
-    filemgr_mutex_unlock(file);
+    file->mutexUnlock();
 
-    atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
-    return FDB_RESULT_SUCCESS;
+    END_HANDLE_BUSY(handle);
+    return status;
 }
 
-LIBFDB_API
-fdb_status fdb_abort_transaction(fdb_file_handle *fhandle)
+fdb_status FdbEngine::endTransaction(FdbFileHandle *fhandle,
+                                     fdb_commit_opt_t opt)
 {
-    return _fdb_abort_transaction(fhandle->root);
-}
+    if (!fhandle || !fhandle->getRootHandle()) {
+        return FDB_RESULT_INVALID_HANDLE;
+    }
 
-fdb_status _fdb_abort_transaction(fdb_kvs_handle *handle)
-{
     file_status_t fstatus;
-    struct filemgr *file;
+    FdbKvsHandle *handle = fhandle->getRootHandle();
+    FileMgr *file;
 
     if (handle->txn == NULL) {
         // there is no transaction started
         return FDB_RESULT_TRANSACTION_FAIL;
     }
     if (handle->kvs) {
-        if (handle->kvs->type == KVS_SUB) {
+        if (handle->kvs->getKvsType() == KVS_SUB) {
             // deny transaction on sub handle
             return FDB_RESULT_INVALID_HANDLE;
         }
-    }
-
-    if (!atomic_cas_uint8_t(&handle->handle_busy, 0, 1)) {
-        return FDB_RESULT_HANDLE_BUSY;
-    }
-
-    do { // repeat until file status is not REMOVED_PENDING
-        fdb_check_file_reopen(handle, NULL);
-
-        file = handle->file;
-        filemgr_mutex_lock(file);
-        fdb_sync_db_header(handle);
-
-        fstatus = filemgr_get_file_status(file);
-        if (fstatus == FILE_REMOVED_PENDING) {
-            // we must not abort transaction on this file
-            // file status was changed by other thread .. start over
-            filemgr_mutex_unlock(file);
-        }
-    } while (fstatus == FILE_REMOVED_PENDING);
-
-    wal_discard(file, handle->txn);
-    wal_remove_transaction(file, handle->txn);
-
-    free(handle->txn->items);
-    free(handle->txn->wrapper);
-    free(handle->txn);
-    handle->txn = NULL;
-
-    filemgr_mutex_unlock(file);
-
-    atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
-    return FDB_RESULT_SUCCESS;
-}
-
-LIBFDB_API
-fdb_status fdb_end_transaction(fdb_file_handle *fhandle,
-                               fdb_commit_opt_t opt)
-{
-    file_status_t fstatus;
-    fdb_kvs_handle *handle = fhandle->root;
-    struct filemgr *file;
-
-    if (handle->txn == NULL) {
-        // there is no transaction started
-        return FDB_RESULT_TRANSACTION_FAIL;
-    }
-    if (handle->kvs) {
-        if (handle->kvs->type == KVS_SUB) {
-            // deny transaction on sub handle
-            return FDB_RESULT_INVALID_HANDLE;
-        }
-    }
-
-    if (!atomic_cas_uint8_t(&handle->handle_busy, 0, 1)) {
-        return FDB_RESULT_HANDLE_BUSY;
     }
 
     fdb_status fs = FDB_RESULT_SUCCESS;
     if (list_begin(handle->txn->items)) {
-        fs = _fdb_commit(handle, opt,
-                       !(handle->config.durability_opt & FDB_DRB_ASYNC));
+        bool sync = !(handle->config.durability_opt & FDB_DRB_ASYNC);
+        fs = commitWithKVHandle(handle, opt, sync);
     }
 
     if (fs == FDB_RESULT_SUCCESS) {
 
         do { // repeat until file status is not REMOVED_PENDING
-            fdb_check_file_reopen(handle, NULL);
+            fs = fdb_check_file_reopen(handle, NULL);
+            if (fs != FDB_RESULT_SUCCESS) {
+                return fs;
+            }
 
             file = handle->file;
-            filemgr_mutex_lock(file);
+            file->mutexLock();
             fdb_sync_db_header(handle);
 
-            fstatus = filemgr_get_file_status(file);
+            fstatus = file->getFileStatus();
             if (fstatus == FILE_REMOVED_PENDING) {
                 // we must not commit transaction on this file
                 // file status was changed by other thread .. start over
-                filemgr_mutex_unlock(file);
+                file->mutexUnlock();
             }
         } while (fstatus == FILE_REMOVED_PENDING);
 
-        wal_remove_transaction(file, handle->txn);
+        file->getWal()->removeTransaction_Wal(handle->txn);
 
         free(handle->txn->items);
         free(handle->txn->wrapper);
         free(handle->txn);
         handle->txn = NULL;
 
-        filemgr_mutex_unlock(file);
+        file->mutexUnlock();
     }
 
-    atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
     return fs;
 }

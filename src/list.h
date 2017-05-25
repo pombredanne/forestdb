@@ -4,18 +4,13 @@
  * (C) 2013  Jung-Sang Ahn <jungsang.ahn@gmail.com>
  */
 
-#ifndef _JSAHN_LIST_H
-#define _JSAHN_LIST_H
+#pragma once
 
 #include <stdint.h>
 #include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "common.h"
 
 //#define _LIST_LOCK
-#include "arch.h"
 
 struct list_elem {
     struct list_elem *prev;
@@ -81,8 +76,7 @@ INLINE struct list_elem *list_prev(struct list_elem *e)
     return e->prev;
 }
 
-#ifdef __cplusplus
+INLINE bool list_empty(struct list *list) {
+    return list->head == NULL;
 }
-#endif
 
-#endif

@@ -25,15 +25,29 @@
 #include "filemgr.h"
 
 INLINE filemgr_magic_t ver_get_latest_magic() {
-    // Use V2 magic until all stale block features are complete
-    return FILEMGR_MAGIC_V2;
-    //return FILEMGR_MAGIC_V3;
+    return FILEMGR_LATEST_MAGIC;
 }
 bool ver_is_valid_magic(filemgr_magic_t magic);
-bool ver_is_atleast_v2(filemgr_magic_t magic);
+bool ver_is_magic_000(filemgr_magic_t magic);
+bool ver_is_atleast_magic_001(filemgr_magic_t magic);
 bool ver_staletree_support(filemgr_magic_t magic);
+bool ver_superblock_support(filemgr_magic_t magic);
 bool ver_non_consecutive_doc(filemgr_magic_t magic);
+bool ver_btreev2_format(filemgr_magic_t magic);
 size_t ver_get_new_filename_off(filemgr_magic_t magic);
+
+/**
+ * Return the version of a given file's magic value
+ *
+ * @param magic ForestDB file magic value
+ * @return Version of a given file's magic value
+ */
+const char* ver_get_version_string(filemgr_magic_t magic);
+
+/**
+ * Return the offset of last_wal_flush_header field in a commit header
+ */
+size_t ver_get_last_wal_flush_hdr_off(filemgr_magic_t magic);
 
 #endif /* _FDB_VERSION_H */
 

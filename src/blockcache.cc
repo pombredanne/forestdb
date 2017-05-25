@@ -22,6 +22,7 @@
 #if !defined(WIN32) && !defined(_WIN32)
 #include <sys/time.h>
 #endif
+#include <map>
 
 #include "hash_functions.h"
 #include "common.h"
@@ -31,7 +32,8 @@
 #include "blockcache.h"
 #include "avltree.h"
 #include "atomic.h"
-
+#include "fdb_internal.h"
+#include "time_utils.h"
 #include "memleak.h"
 
 #ifdef __DEBUG
@@ -45,343 +47,346 @@
 #endif
 #endif
 
-// global lock
-static spin_t bcache_lock;
+std::atomic<BlockCacheManager *> BlockCacheManager::instance(nullptr);
+std::mutex BlockCacheManager::instanceMutex;
+const uint64_t BlockCacheManager::defaultCacheSize = 134217728; // 128MB
+const uint32_t BlockCacheManager::defaultBlockSize = FDB_BLOCKSIZE; // 4KB
 
-// hash table for filename
-static struct hash fnamedic;
+class BlockCacheItem {
+public:
+    BlockCacheItem() : bid(BLK_NOT_FOUND), addr(NULL), flag(0), score(0) {
+        list_elem.prev = list_elem.next = NULL;
+    }
 
-// free block list
-static volatile size_t freelist_count;
-static struct list freelist;
-static spin_t freelist_lock;
+    BlockCacheItem(bid_t _bid, void *_addr, uint8_t _flag, uint8_t _score) :
+        bid(_bid), addr(_addr), flag(_flag), score(_score) {
+        list_elem.prev = list_elem.next = NULL;
+    }
+
+    ~BlockCacheItem() { }
+
+    bid_t getBid(void) const {
+        return bid;
+    }
+
+    void *getBlockAddr(void) const {
+        return addr;
+    }
+
+    uint8_t getFlag(void) const {
+        return flag;
+    }
+
+    uint8_t getScore(void) const {
+        return score;
+    }
+
+    void setBid(bid_t _bid) {
+        bid = _bid;
+    }
+
+    void setFlag(uint8_t _flag) {
+        flag = _flag;
+    }
+
+    void setScore(uint8_t _score) {
+        score = _score;
+    }
+
+    // list elem for {free, clean} lists
+    struct list_elem list_elem;
+
+private:
+    // block ID
+    bid_t bid;
+    // block address
+    void *addr;
+    // Flag indicating if a given block is dirty or immutable or free to use
+    std::atomic<uint8_t> flag;
+    // cache block score
+    uint8_t score;
+};
+
+typedef std::unordered_map<bid_t, BlockCacheItem *> block_map_t;
+
+class BlockCacheShard {
+public:
+    BlockCacheShard() {
+        spin_init(&lock);
+        list_init(&cleanBlocks);
+    }
+
+    ~BlockCacheShard() {
+        spin_destroy(&lock);
+        // Free all the blocks allocated to this shard
+        for (auto &block_entry : allBlocks) {
+            delete block_entry.second;
+        }
+    }
+
+    bool empty() {
+        // Caller should grab the shard lock before calling this function.
+        return list_empty(&cleanBlocks) && dirtyDataBlocks.empty() &&
+            dirtyIndexBlocks.empty();
+    }
+
+private:
+    friend class BlockCacheManager;
+    friend class FileBlockCache;
+
+    spin_t lock;
+    // LRU List of clean blocks
+    struct list cleanBlocks;
+    // Tree map of dirty data blocks
+    std::map<bid_t, BlockCacheItem *> dirtyDataBlocks;
+    // Tree map of dirty index blocks
+    std::map<bid_t, BlockCacheItem *> dirtyIndexBlocks;
+    // Hashtable of all the blocks belonging to this shard
+    block_map_t allBlocks;
+};
+
+FileBlockCache::FileBlockCache()
+    : curFile(NULL), refCount(0), numVictims(0), numItems(0), numImmutables(0),
+      accessTimestamp(0), numShards(DEFAULT_NUM_BCACHE_PARTITIONS) { }
+
+FileBlockCache::FileBlockCache(std::string fname, FileMgr *file,
+                               size_t num_shards)
+    : fileName(fname), curFile(file), refCount(0), numVictims(0), numItems(0),
+      numImmutables(0), accessTimestamp(0), numShards(num_shards)
+{
+    // Create a block cache shard instance.
+    for (size_t i = 0; i < numShards; ++i) {
+        BlockCacheShard *shard = new BlockCacheShard();
+        shards.push_back(shard);
+    }
+}
+
+FileBlockCache::~FileBlockCache() {
+        for (auto shard : shards) {
+            delete shard;
+        }
+    }
+
+const std::string& FileBlockCache::getFileName(void) const {
+    return fileName;
+}
+
+FileMgr* FileBlockCache::getFileManager(void) const {
+    return curFile;
+}
+
+uint32_t FileBlockCache::getRefCount(void) const {
+    return refCount;
+}
+
+uint64_t FileBlockCache::getNumVictims(void) const {
+    return numVictims;
+}
+
+uint64_t FileBlockCache::getNumItems(void) const {
+    return numItems;
+}
+
+uint64_t FileBlockCache::getNumImmutables(void) const {
+    return numImmutables;
+}
+
+uint64_t FileBlockCache::getAccessTimestamp(void) const {
+    return accessTimestamp.load(std::memory_order_relaxed);
+}
+
+size_t FileBlockCache::getNumShards(void) const {
+    return numShards;
+}
+
+void FileBlockCache::setAccessTimestamp(uint64_t timestamp) {
+    accessTimestamp.store(timestamp, std::memory_order_relaxed);
+}
+
+bool FileBlockCache::empty() {
+    bool empty = true;
+    size_t i = 0;
+    acquireAllShardLocks();
+    for (; i < numShards; ++i) {
+        if (!shards[i]->empty()) {
+            empty = false;
+            break;
+        }
+    }
+    releaseAllShardLocks();
+    return empty;
+}
+
+void FileBlockCache::acquireAllShardLocks() {
+    size_t i = 0;
+    for (; i < numShards; ++i) {
+        spin_lock(&shards[i]->lock);
+    }
+}
+
+void FileBlockCache::releaseAllShardLocks() {
+    size_t i = 0;
+    for (; i < numShards; ++i) {
+        spin_unlock(&shards[i]->lock);
+    }
+}
 
 static const size_t MAX_VICTIM_SELECTIONS = 5;
-
-// file structure list
-static size_t num_files;
-static size_t file_array_capacity;
-static fnamedic_item ** file_list;
-static struct list file_zombies;
-static rw_spin_t filelist_lock; // Reader-Writer spinlock for the file list.
-
-//static struct list cleanlist, dirtylist;
-//static uint64_t nfree, nclean, ndirty;
-static uint64_t bcache_nblock;
-
-static int bcache_blocksize;
-static size_t bcache_flush_unit;
-
-struct bcache_shard {
-    spin_t lock;
-    // list for clean blocks
-    struct list cleanlist;
-    // tree for normal dirty blocks
-    struct avl_tree tree;
-    // tree for index nodes
-    struct avl_tree tree_idx;
-    // hash table for block lookup
-    struct hash hashtable;
-    // list elem for shard LRU
-    struct list_elem le;
-};
-
-struct fnamedic_item {
-    char *filename;
-    uint16_t filename_len;
-    uint32_t hash;
-
-    // current opened filemgr instance
-    // (can be changed on-the-fly when file is closed and re-opened)
-    struct filemgr *curfile;
-
-    // Shards of the block cache for a file.
-    struct bcache_shard *shards;
-
-    // list elem for FILE_ZOMBIE
-    struct list_elem le;
-    // hash elem for FNAMEDIC
-    struct hash_elem hash_elem;
-
-    atomic_uint32_t ref_count;
-    atomic_uint64_t nvictim;
-    atomic_uint64_t nitems;
-    atomic_uint64_t nimmutable;
-    atomic_uint64_t access_timestamp;
-    size_t num_shards;
-};
+static const size_t MIN_TIMESTAMP_GAP = 15000; // 15 seconds
 
 #define BCACHE_DIRTY (0x1)
 #define BCACHE_IMMUTABLE (0x2)
 #define BCACHE_FREE (0x4)
 
-static void *buffercache_addr = NULL;
-
-struct bcache_item {
-    // BID
-    bid_t bid;
-    // contents address
-    void *addr;
-    // hash elem for lookup hash table
-    struct hash_elem hash_elem;
-    // list elem for {free, clean, dirty} lists
-    struct list_elem list_elem;
-    // flag
-    uint8_t flag;
-    // score
-    uint8_t score;
-};
-
-struct dirty_item {
-    struct bcache_item *item;
-    struct avl_node avl;
-};
-
-INLINE int _dirty_cmp(struct avl_node *a, struct avl_node *b, void *aux)
-{
-    struct dirty_item *aa, *bb;
-    aa = _get_entry(a, struct dirty_item, avl);
-    bb = _get_entry(b, struct dirty_item, avl);
-
-    #ifdef __BIT_CMP
-        return _CMP_U64(aa->item->bid , bb->item->bid);
-
-    #else
-        if (aa->item->bid < bb->item->bid) return -1;
-        else if (aa->item->bid > bb->item->bid) return 1;
-        else return 0;
-
-    #endif
-}
-
-INLINE uint32_t _fname_hash(struct hash *hash, struct hash_elem *e)
-{
-    struct fnamedic_item *item;
-    item = _get_entry(e, struct fnamedic_item, hash_elem);
-    return item->hash % ((unsigned)(BCACHE_NDICBUCKET));
-}
-
-INLINE int _fname_cmp(struct hash_elem *a, struct hash_elem *b)
-{
-    size_t len;
-    struct fnamedic_item *aa, *bb;
-    aa = _get_entry(a, struct fnamedic_item, hash_elem);
-    bb = _get_entry(b, struct fnamedic_item, hash_elem);
-
-    if (aa->filename_len == bb->filename_len) {
-        return memcmp(aa->filename, bb->filename, aa->filename_len);
-    }else {
-        len = MIN(aa->filename_len , bb->filename_len);
-        int cmp = memcmp(aa->filename, bb->filename, len);
-        if (cmp != 0) return cmp;
-        else {
-            return (int)((int)aa->filename_len - (int)bb->filename_len);
-        }
-    }
-}
-
-INLINE uint32_t _bcache_hash(struct hash *hash, struct hash_elem *e)
-{
-    struct bcache_item *item = _get_entry(e, struct bcache_item, hash_elem);
-    return (item->bid) % ((uint32_t)BCACHE_NBUCKET);
-}
-
-INLINE int _bcache_cmp(struct hash_elem *a, struct hash_elem *b)
-{
-    struct bcache_item *aa, *bb;
-    aa = _get_entry(a, struct bcache_item, hash_elem);
-    bb = _get_entry(b, struct bcache_item, hash_elem);
-
-    #ifdef __BIT_CMP
-
-        return _CMP_U64(aa->bid, bb->bid);
-
-    #else
-
-        if (aa->bid == bb->bid) return 0;
-        else if (aa->bid < bb->bid) return -1;
-        else return 1;
-
-    #endif
-}
-
-#define _list_empty(list) (list.head == NULL)
-#define _tree_empty(tree) (tree.root == NULL)
-
-static void _acquire_all_shard_locks(struct fnamedic_item *fname) {
-    size_t i = 0;
-    for (; i < fname->num_shards; ++i) {
-        spin_lock(&fname->shards[i].lock);
-    }
-}
-
-static void _release_all_shard_locks(struct fnamedic_item *fname) {
-    size_t i = 0;
-    for (; i < fname->num_shards; ++i) {
-        spin_unlock(&fname->shards[i].lock);
-    }
-}
-
-static bool _file_empty(struct fnamedic_item *fname) {
-    bool empty = true;
-    size_t i = 0;
-    _acquire_all_shard_locks(fname);
-    for (; i < fname->num_shards; ++i) {
-        if (!(_list_empty(fname->shards[i].cleanlist) &&
-              _tree_empty(fname->shards[i].tree) &&
-              _tree_empty(fname->shards[i].tree_idx))) {
-            empty = false;
-            break;
-        }
-    }
-    _release_all_shard_locks(fname);
-    return empty;
-}
-
-INLINE bool _shard_empty(struct bcache_shard *bshard) {
-    // Caller should grab the shard lock before calling this function.
-    return _list_empty(bshard->cleanlist) &&
-           _tree_empty(bshard->tree) &&
-           _tree_empty(bshard->tree_idx);
-}
-
-struct fnamedic_item *_bcache_get_victim()
-{
-    struct fnamedic_item *ret = NULL;
-    uint64_t min_timestamp = (uint64_t) -1;
+FileBlockCache *BlockCacheManager::chooseEvictionVictim() {
+    FileBlockCache *ret = NULL;
+    uint64_t max_items = 0;
+    uint64_t min_timestamp = static_cast<uint64_t>(-1);
+    uint64_t max_timestamp = 0;
     uint64_t victim_timestamp;
-    int victim_idx;
+    uint64_t victim_num_items;
+    int victim_idx, victim_by_time, victim_by_items;
     size_t num_attempts;
 
-    rw_spin_read_lock(&filelist_lock);
-    // Pick the victim that has the smallest access timestamp among files randomly selected.
-    num_attempts = num_files / 10 + 1;
-     if (num_attempts > MAX_VICTIM_SELECTIONS) {
-         num_attempts = MAX_VICTIM_SELECTIONS;
-     } else {
-         if(num_attempts == 1 && num_files > 1) {
-             ++num_attempts;
-         }
-     }
-     for (size_t i = 0; i < num_attempts && num_files; ++i) {
-         victim_idx = rand() % num_files;
-         victim_timestamp = atomic_get_uint64_t(&file_list[victim_idx]->access_timestamp);
-         if (victim_timestamp < min_timestamp &&
-             atomic_get_uint64_t(&file_list[victim_idx]->nitems)) {
-             min_timestamp = victim_timestamp;
-             ret = file_list[victim_idx];
-         }
-     }
+    if (reader_lock(&fileListLock) == 0) {
+        // Pick the victim that has the oldest access timestamp
+        // among the files randomly selected, if the gap between
+        // the oldest and newest timestamps is greater than the threshold.
+        // Otherwise, pick the victim that has the largest number of
+        // cached items among the files.
+        num_attempts = fileList.size() / 10 + 1;
+        if (num_attempts > MAX_VICTIM_SELECTIONS) {
+            num_attempts = MAX_VICTIM_SELECTIONS;
+        } else {
+            if(num_attempts == 1 && fileList.size() > 1) {
+                ++num_attempts;
+            }
+        }
 
-    if (ret) {
-        atomic_incr_uint32_t(&ret->ref_count);
+        victim_by_time = victim_by_items = -1;
+
+        for (size_t i = 0; i < num_attempts && !fileList.empty(); ++i) {
+            victim_idx = rand() % fileList.size();
+            victim_timestamp = fileList[victim_idx]->getAccessTimestamp();
+            victim_num_items = fileList[victim_idx]->numItems;
+
+            if (victim_num_items) {
+                if (victim_timestamp < min_timestamp) {
+                    min_timestamp = victim_timestamp;
+                    victim_by_time = victim_idx;
+                }
+                if (victim_timestamp > max_timestamp) {
+                    max_timestamp = victim_timestamp;
+                }
+                if (victim_num_items > max_items) {
+                    max_items = victim_num_items;
+                    victim_by_items = victim_idx;
+                }
+            }
+        }
+
+
+        if (max_timestamp - min_timestamp > MIN_TIMESTAMP_GAP) {
+            if (victim_by_time != -1) {
+                ret = fileList[victim_by_time];
+            }
+        } else {
+            if (victim_by_items != -1) {
+                ret = fileList[victim_by_items];
+            }
+        }
+
+        if (ret) {
+            ret->refCount++;
+        }
+        reader_unlock(&fileListLock);
+    } else {
+        fprintf(stderr, "Error in BlockCacheManager::chooseEvictionVictim(): "
+                        "Failed to acquire ReaderLock on a file list lock!\n");
     }
-    rw_spin_read_unlock(&filelist_lock);
 
     return ret;
 }
 
-static struct bcache_item *_bcache_alloc_freeblock()
-{
-    struct list_elem *e = NULL;
-    struct bcache_item *item;
+BlockCacheItem *BlockCacheManager::getFreeBlock() {
+    struct list_elem *elem = NULL;
 
-    spin_lock(&freelist_lock);
-    e = list_pop_front(&freelist);
-    if (e) {
-        freelist_count--;
+    spin_lock(&freeListLock);
+    elem = list_pop_front(&freeList);
+    if (elem) {
+        freeListCount--;
     }
-    spin_unlock(&freelist_lock);
+    spin_unlock(&freeListLock);
 
-    if (e) {
-        item = _get_entry(e, struct bcache_item, list_elem);
+    if (elem) {
+        BlockCacheItem *item = reinterpret_cast<BlockCacheItem *>(elem);
         return item;
     }
+
     return NULL;
 }
 
-static void _bcache_release_freeblock(struct bcache_item *item)
+void BlockCacheManager::addToFreeBlockList(BlockCacheItem *item) {
+    spin_lock(&freeListLock);
+    item->setFlag(BCACHE_FREE);
+    item->setScore(0);
+    list_push_front(&freeList, &item->list_elem);
+    ++freeListCount;
+    spin_unlock(&freeListLock);
+}
+
+bool BlockCacheManager::freeFileBlockCache(FileBlockCache *fcache,
+                                           bool force)
 {
-    spin_lock(&freelist_lock);
-    item->flag = BCACHE_FREE;
-    item->score = 0;
-    list_push_front(&freelist, &item->list_elem);
-    freelist_count++;
-    spin_unlock(&freelist_lock);
-}
-
-static struct fnamedic_item *_next_dead_fname_zombie(void) {
-    struct list_elem *e;
-    struct fnamedic_item *fname_item;
-    bool found = false;
-    rw_spin_write_lock(&filelist_lock);
-    e = list_begin(&file_zombies);
-    while (e) {
-        fname_item = _get_entry(e, struct fnamedic_item, le);
-        if (atomic_get_uint32_t(&fname_item->ref_count) == 0) {
-            list_remove(&file_zombies, e);
-            found = true;
-            break;
-        } else {
-            e = list_next(e);
-        }
+    // file block cache must be empty
+    if (!fcache->empty() && !force) {
+        DBG("Warning: failed to free a file block cache instance for a file '%s' "
+            "because the file block cache instance is not empty!\n",
+            fcache->getFileName().c_str());
+        return false;
     }
-    rw_spin_write_unlock(&filelist_lock);
-    return found ? fname_item : NULL;
-}
 
-static void _fname_free(struct fnamedic_item *fname);
-
-static void _garbage_collect_zombie_fnames(void) {
-    struct fnamedic_item *fname_item = _next_dead_fname_zombie();
-    while (fname_item) {
-        _fname_free(fname_item);
-        fname_item = _next_dead_fname_zombie();
+    if (fcache->getRefCount() != 0 && !force) {
+        DBG("Warning: failed to free a file block cache instance for a file '%s' "
+            "because its ref counter is not zero!\n",
+            fcache->getFileName().c_str());
+        return false;
     }
+
+    // free a file block cache
+    delete fcache;
+    return true;
 }
 
-struct dirty_bid {
-    bid_t bid;
-    struct avl_node avl;
-};
+void BlockCacheManager::cleanUpInvalidFileBlockCaches() {
+    FileBlockCache *fcache;
 
-INLINE int _dirty_bid_cmp(struct avl_node *a, struct avl_node *b, void *aux)
-{
-    struct dirty_bid *aa, *bb;
-    aa = _get_entry(a, struct dirty_bid, avl);
-    bb = _get_entry(b, struct dirty_bid, avl);
-
-    #ifdef __BIT_CMP
-        return _CMP_U64(aa->bid , bb->bid);
-
-    #else
-        if (aa->bid < bb->bid) return -1;
-        else if (aa->bid > bb->bid) return 1;
-        else return 0;
-
-    #endif
-}
-
-static void _free_dirty_bids(struct dirty_bid **dirty_bids, size_t n) {
-    size_t i = 0;
-    for (; i < n; ++i) {
-        if (dirty_bids[i]) {
-            mempool_free(dirty_bids[i]);
+    if (writer_lock(&fileListLock) == 0) {
+        std::list<FileBlockCache *>::iterator iter = fileZombies.begin();
+        for (; iter != fileZombies.end();) {
+            fcache = *iter;
+            if (freeFileBlockCache(fcache)) {
+                iter = fileZombies.erase(iter);
+            } else {
+                ++iter;
+            }
         }
+        writer_unlock(&fileListLock);
+    } else {
+        fprintf(stderr, "Error in cleanUpInvalidFileBlockCaches(): "
+                        "Failed to acquire WriterLock on a file list lock!\n");
     }
 }
 
 // Flush some consecutive or all dirty blocks for a given file and
 // move them to the clean list.
-static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
-                                      bool sync, bool flush_all,
-                                      bool immutables_only)
-{
+fdb_status BlockCacheManager::flushDirtyBlocks(FileBlockCache *fcache,
+                                               bool sync,
+                                               bool flush_all,
+                                               bool immutables_only) {
     void *buf = NULL;
-    struct list_elem *prevhead = NULL;
-    struct avl_tree *cur_tree = NULL;
-    struct avl_node *node = NULL;
-    struct dirty_bid *dbid = NULL;
+    std::map<bid_t, BlockCacheItem *> *shard_dirty_tree;
+
     uint64_t count = 0;
     ssize_t ret = 0;
     bid_t start_bid = 0, prev_bid = 0;
@@ -390,58 +395,60 @@ static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
     fdb_status status = FDB_RESULT_SUCCESS;
     bool o_direct = false;
     bool data_block_completed = false;
-    struct avl_tree dirty_blocks; // Cross-shard dirty block list for sequential writes.
 
-    if (fname_item->curfile->config->flag & _ARCH_O_DIRECT) {
+    // Cross-shard dirty block list for sequential writes.
+    std::map<bid_t, BlockCacheItem *> dirty_blocks;
+
+    if (fcache->getFileManager()->getConfig()->getFlag() & _ARCH_O_DIRECT) {
         o_direct = true;
     }
 
     // scan and write back dirty blocks sequentially for O_DIRECT option.
     if (sync && o_direct) {
-        malloc_align(buf, FDB_SECTOR_SIZE, bcache_flush_unit);
-        _acquire_all_shard_locks(fname_item);
+        malloc_align(buf, FDB_SECTOR_SIZE, flushUnit);
+        fcache->acquireAllShardLocks();
     }
 
     prev_bid = start_bid = BLK_NOT_FOUND;
     count = 0;
 
-    avl_init(&dirty_blocks, NULL);
-
     // Try to flush the dirty data blocks first and then index blocks.
     size_t i = 0;
     bool consecutive_blocks = true;
-    struct dirty_bid **dirty_bids = alca(struct dirty_bid *, fname_item->num_shards);
-    memset(dirty_bids, 0x0, sizeof(dirty_bid *) * fname_item->num_shards);
+    BlockCacheItem *item = NULL;
+
     while (1) {
-        if (!(node = avl_first(&dirty_blocks))) {
-            for (i = 0; i < fname_item->num_shards; ++i) {
+        if (dirty_blocks.empty()) {
+            for (i = 0; i < fcache->getNumShards(); ++i) {
                 if (!(sync && o_direct)) {
-                    spin_lock(&fname_item->shards[i].lock);
+                    spin_lock(&fcache->shards[i]->lock);
                 }
                 if (!data_block_completed) {
-                    node = avl_first(&fname_item->shards[i].tree);
+                    auto entry = fcache->shards[i]->dirtyDataBlocks.begin();
+                    if (entry != fcache->shards[i]->dirtyDataBlocks.end()) {
+                        item = entry->second;
+                    } else {
+                        item = NULL;
+                    }
                 } else {
-                    node = avl_first(&fname_item->shards[i].tree_idx);
+                    auto entry = fcache->shards[i]->dirtyIndexBlocks.begin();
+                    if (entry != fcache->shards[i]->dirtyIndexBlocks.end()) {
+                        item = entry->second;
+                    } else {
+                        item = NULL;
+                    }
                 }
-                if (node) {
-                    struct dirty_item *ditem = _get_entry(node,
-                                                struct dirty_item, avl);
+                if (item) {
                     if (!immutables_only || // don't load mutable items
-                        ditem->item->flag & BCACHE_IMMUTABLE) {
-                        if (!dirty_bids[i]) {
-                            dirty_bids[i] = (struct dirty_bid *)
-                                mempool_alloc(sizeof(struct dirty_bid));
-                        }
-                        dirty_bids[i]->bid = ditem->item->bid;
-                        avl_insert(&dirty_blocks, &dirty_bids[i]->avl,
-                                   _dirty_bid_cmp);
+                        item->getFlag() & BCACHE_IMMUTABLE) {
+                        dirty_blocks.insert(std::make_pair(item->getBid(), item));
                     }
                 }
                 if (!(sync && o_direct)) {
-                    spin_unlock(&fname_item->shards[i].lock);
+                    spin_unlock(&fcache->shards[i]->lock);
                 }
             }
-            if (!(node = avl_first(&dirty_blocks))) {
+            if (dirty_blocks.empty()) {
                 if (!data_block_completed) {
                     data_block_completed = true;
                     if (count > 0 && !flush_all) {
@@ -457,37 +464,38 @@ static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
             }
         }
 
-        dbid = _get_entry(node, struct dirty_bid, avl);
+        auto dirty_entry = dirty_blocks.begin();
+        bid_t dirty_bid = dirty_entry->first;
 
-        size_t shard_num = dbid->bid % fname_item->num_shards;
+        size_t shard_num = dirty_bid % fcache->getNumShards();
         if (!(sync && o_direct)) {
-            spin_lock(&fname_item->shards[shard_num].lock);
+            spin_lock(&fcache->shards[shard_num]->lock);
         }
         if (!data_block_completed) {
-            cur_tree = &fname_item->shards[shard_num].tree;
+            shard_dirty_tree = &fcache->shards[shard_num]->dirtyDataBlocks;
         } else {
-            cur_tree = &fname_item->shards[shard_num].tree_idx;
+            shard_dirty_tree = &fcache->shards[shard_num]->dirtyIndexBlocks;
         }
 
-        struct dirty_item *dirty_block = NULL;
+        BlockCacheItem *dirty_block = NULL;
         bool item_exist = false;
-        node = avl_first(cur_tree);
-        if (node) {
-            dirty_block = _get_entry(node, struct dirty_item, avl);
-            if (dbid->bid == dirty_block->item->bid) {
+        if (!shard_dirty_tree->empty()) {
+            auto entry = shard_dirty_tree->begin();
+            dirty_block = entry->second;
+            if (dirty_bid == dirty_block->getBid()) {
                 item_exist = true;
             }
         }
+
         // remove from the cross-shard dirty block list.
-        avl_remove(&dirty_blocks, &dbid->avl);
+        dirty_blocks.erase(dirty_bid);
         if (!item_exist) {
             // The original first item in the shard dirty block list was removed.
             // Grab the next one from the cross-shard dirty block list.
             if (!(sync && o_direct)) {
-                spin_unlock(&fname_item->shards[shard_num].lock);
+                spin_unlock(&fcache->shards[shard_num]->lock);
             }
-            if (immutables_only &&
-                !atomic_get_uint64_t(&fname_item->nimmutable)) {
+            if (immutables_only && !fcache->numImmutables.load()) {
                 break;
             }
             continue;
@@ -495,46 +503,45 @@ static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
 
         consecutive_blocks = true;
         // if BID of next dirty block is not consecutive .. stop
-        if (dirty_block->item->bid != prev_bid + 1 && prev_bid != BLK_NOT_FOUND &&
+        if (dirty_block->getBid() != prev_bid + 1 && prev_bid != BLK_NOT_FOUND &&
             sync) {
             if (flush_all) {
                 consecutive_blocks = false;
             } else {
                 if (!(sync && o_direct)) {
-                    spin_unlock(&fname_item->shards[shard_num].lock);
+                    spin_unlock(&fcache->shards[shard_num]->lock);
                 }
                 break;
             }
         }
         // set START_BID if this is the start block for a single batch write.
         if (start_bid == BLK_NOT_FOUND) {
-            start_bid = dirty_block->item->bid;
+            start_bid = dirty_block->getBid();
         }
         // set PREV_BID and go to next block
-        prev_bid = dirty_block->item->bid;
+        prev_bid = dirty_block->getBid();
 
         // set PTR and get block MARKER
-        ptr = dirty_block->item->addr;
-        marker = *((uint8_t*)(ptr) + bcache_blocksize-1);
+        ptr = dirty_block->getBlockAddr();
+        marker = *((uint8_t*)(ptr) + blockSize - 1);
 
-        node = avl_next(node);
         // Get the next dirty block from the victim shard and insert it into
         // the cross-shard dirty block list.
-        if (node) {
-            struct dirty_item *ditem = _get_entry(node, struct dirty_item,
-                                                  avl);
-            if (!immutables_only || ditem->item->flag & BCACHE_IMMUTABLE) {
-                dbid->bid = ditem->item->bid;
-                avl_insert(&dirty_blocks, &dbid->avl, _dirty_bid_cmp);
+        if (shard_dirty_tree->size() > 1) {
+            auto entry = shard_dirty_tree->begin();
+            ++entry;
+            BlockCacheItem *ditem = entry->second;
+            if (!immutables_only || ditem->getFlag() & BCACHE_IMMUTABLE) {
+                dirty_blocks.insert(std::make_pair(ditem->getBid(), ditem));
             }
         }
 
         // remove from the shard dirty block list.
-        avl_remove(cur_tree, &dirty_block->avl);
-        if (dirty_block->item->flag & BCACHE_IMMUTABLE) {
-            atomic_decr_uint64_t(&fname_item->nimmutable);
+        shard_dirty_tree->erase(dirty_block->getBid());
+        if (dirty_block->getFlag() & BCACHE_IMMUTABLE) {
+            fcache->numImmutables--;
             if (!(sync && o_direct)) {
-                spin_unlock(&fname_item->shards[shard_num].lock);
+                spin_unlock(&fcache->shards[shard_num]->lock);
             }
         }
 
@@ -546,78 +553,76 @@ static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
                 memset((uint8_t *)(ptr) + BTREE_CRC_OFFSET,
                        0xff, BTREE_CRC_FIELD_LEN);
                 uint32_t crc = get_checksum(reinterpret_cast<const uint8_t*>(ptr),
-                                            bcache_blocksize,
-                                            fname_item->curfile->crc_mode);
+                                            blockSize,
+                                            fcache->getFileManager()->getCrcMode());
                 crc = _endian_encode(crc);
                 memcpy((uint8_t *)(ptr) + BTREE_CRC_OFFSET, &crc, sizeof(crc));
             }
 #endif
             if (o_direct) {
                 if (count > 0 && !consecutive_blocks) {
-                    size_t bytes_written;
+                    int64_t bytes_written;
                     // Note that this path can be only executed in flush_all case.
-                    bytes_written = (size_t)filemgr_write_blocks(fname_item->curfile,
-                                                                 buf, count, start_bid);
-                    if (bytes_written != count * bcache_blocksize) {
+                    bytes_written = fcache->getFileManager()->writeBlocks(buf,
+                                                                          count,
+                                                                          start_bid);
+                    if ((uint64_t)bytes_written != count * blockSize) {
                         count = 0;
-                        status = FDB_RESULT_WRITE_FAIL;
+                        status = bytes_written < 0 ?
+                            (fdb_status) bytes_written : FDB_RESULT_WRITE_FAIL;
                         break;
                     }
                     // Start a new batch again.
                     count = 0;
-                    start_bid = dirty_block->item->bid;
+                    start_bid = dirty_block->getBid();
                 }
-                memcpy((uint8_t *)(buf) + count*bcache_blocksize,
-                       dirty_block->item->addr, bcache_blocksize);
+                memcpy((uint8_t *)(buf) + count * blockSize,
+                       dirty_block->getBlockAddr(), blockSize);
             } else {
-                ret = filemgr_write_blocks(fname_item->curfile,
-                                           dirty_block->item->addr,
-                                           1,
-                                           dirty_block->item->bid);
-                if (ret != bcache_blocksize) {
-                    if (!(dirty_block->item->flag & BCACHE_IMMUTABLE) &&
+                ret = fcache->getFileManager()->writeBlocks(
+                                            dirty_block->getBlockAddr(),
+                                            1,
+                                            dirty_block->getBid());
+                if (ret != blockSize) {
+                    if (!(dirty_block->getFlag() & BCACHE_IMMUTABLE) &&
                         !(sync && o_direct)) {
-                        spin_unlock(&fname_item->shards[shard_num].lock);
+                        spin_unlock(&fcache->shards[shard_num]->lock);
                     }
-                    status = FDB_RESULT_WRITE_FAIL;
+                    status = ret < 0 ? (fdb_status) ret : FDB_RESULT_WRITE_FAIL;
                     break;
                 }
             }
         }
 
         if (!(sync && o_direct)) {
-            if (dirty_block->item->flag & BCACHE_IMMUTABLE) {
-                spin_lock(&fname_item->shards[shard_num].lock);
+            if (dirty_block->getFlag() & BCACHE_IMMUTABLE) {
+                spin_lock(&fcache->shards[shard_num]->lock);
             }
         }
 
-        dirty_block->item->flag &= ~(BCACHE_DIRTY);
-        dirty_block->item->flag &= ~(BCACHE_IMMUTABLE);
+        dirty_block->setFlag(dirty_block->getFlag() & ~(BCACHE_DIRTY));
+        dirty_block->setFlag(dirty_block->getFlag() & ~(BCACHE_IMMUTABLE));
         // move to the shard clean block list.
-        prevhead = fname_item->shards[shard_num].cleanlist.head;
-        (void)prevhead;
-        list_push_front(&fname_item->shards[shard_num].cleanlist,
-                        &dirty_block->item->list_elem);
+        list_push_front(&fcache->shards[shard_num]->cleanBlocks,
+                        &dirty_block->list_elem);
 
-        fdb_assert(!(dirty_block->item->flag & BCACHE_FREE),
-                   dirty_block->item->flag, BCACHE_FREE);
-        fdb_assert(dirty_block->item->list_elem.prev == NULL &&
-                   prevhead == dirty_block->item->list_elem.next,
-                   prevhead, dirty_block->item->list_elem.next);
-        mempool_free(dirty_block);
+        fdb_assert(!(dirty_block->getFlag() & BCACHE_FREE),
+                   dirty_block->getFlag(), BCACHE_FREE);
 
         if (!(sync && o_direct)) {
-            spin_unlock(&fname_item->shards[shard_num].lock);
+            spin_unlock(&fcache->shards[shard_num]->lock);
         }
 
         count++;
-        if (count*bcache_blocksize >= bcache_flush_unit && sync) {
+        if (count * blockSize >= flushUnit && sync) {
             if (flush_all) {
                 if (o_direct) {
-                    ret = filemgr_write_blocks(fname_item->curfile, buf, count, start_bid);
-                    if ((size_t)ret != count * bcache_blocksize) {
+                    ret = fcache->getFileManager()->writeBlocks(buf,
+                                                                count,
+                                                                start_bid);
+                    if ((size_t)ret != count * blockSize) {
                         count = 0;
-                        status = FDB_RESULT_WRITE_FAIL;
+                        status = ret < 0 ? (fdb_status) ret : FDB_RESULT_WRITE_FAIL;
                         break;
                     }
                     count = 0;
@@ -633,88 +638,86 @@ static fdb_status _flush_dirty_blocks(struct fnamedic_item *fname_item,
     // synchronize
     if (sync && o_direct) {
         if (count > 0) {
-            ret = filemgr_write_blocks(fname_item->curfile, buf, count, start_bid);
-            if ((size_t)ret != count * bcache_blocksize) {
-                status = FDB_RESULT_WRITE_FAIL;
+            ret = fcache->getFileManager()->writeBlocks(buf, count, start_bid);
+            if ((size_t)ret != count * blockSize) {
+                status = ret < 0 ? (fdb_status) ret : FDB_RESULT_WRITE_FAIL;
             }
         }
-        _release_all_shard_locks(fname_item);
+        fcache->releaseAllShardLocks();
         free_align(buf);
     }
 
-    _free_dirty_bids(dirty_bids, fname_item->num_shards);
     return status;
 }
 
-// perform eviction
-static struct list_elem * _bcache_evict(struct fnamedic_item *curfile)
-{
+void BlockCacheManager::performEviction() {
     size_t n_evict;
-    struct list_elem *e = NULL;
-    struct bcache_item *item;
-    struct fnamedic_item *victim = NULL;
+    struct list_elem *elem = NULL;
+    BlockCacheItem *item = NULL;
+    FileBlockCache *victim = NULL;
 
     // We don't need to grab the global buffer cache lock here because
-    // the file's buffer cache instance (fnamedic_item) can be freed only if
+    // the file's buffer cache instance (FileBlockCache) can be freed only if
     // there are no database handles opened for that file.
 
     while (victim == NULL) {
         // select a victim file
-        victim = _bcache_get_victim();
-        while(victim) {
+        victim = chooseEvictionVictim();
+        if (victim) {
             // check whether this file has at least one block to be evictied
-            if (atomic_get_uint64_t(&victim->nitems)) {
+            if (victim->numItems.load()) {
                 // select this file as victim
                 break;
             } else {
-                atomic_decr_uint32_t(&victim->ref_count);
+                victim->refCount--;
                 victim = NULL; // Try to select a victim again
             }
         }
     }
     fdb_assert(victim, victim, NULL);
 
-    atomic_incr_uint64_t(&victim->nvictim);
+    victim->numVictims++;
 
     // select the clean blocks from the victim file
     n_evict = 0;
-    while(n_evict < BCACHE_EVICT_UNIT) {
-        size_t num_shards = victim->num_shards;
+    while (n_evict < BCACHE_EVICT_UNIT) {
+        size_t num_shards = victim->getNumShards();
         size_t i = random(num_shards);
         bool found_victim_shard = false;
-        bcache_shard *bshard = NULL;
+        BlockCacheShard *bshard = NULL;
 
         for (size_t to_visit = num_shards; to_visit; --to_visit) {
             i = (i + 1) % num_shards; // Round robin over empty shards..
-            bshard = &victim->shards[i];
+            bshard = victim->shards[i];
             spin_lock(&bshard->lock);
-            if (_shard_empty(bshard)) {
+            if (bshard->empty()) {
                 spin_unlock(&bshard->lock);
                 continue;
             }
-            e = list_pop_back(&bshard->cleanlist);
-            if(!e) {
+
+            if (list_empty(&bshard->cleanBlocks)) {
                 spin_unlock(&bshard->lock);
                 // When the victim shard has no clean block, evict some dirty blocks
                 // from shards.
-                if (_flush_dirty_blocks(victim, true, false, false)
+                if (flushDirtyBlocks(victim, true, false, false)
                     != FDB_RESULT_SUCCESS) {
-                    atomic_decr_uint32_t(&victim->ref_count);
-                    return NULL;
+                    victim->refCount--;
+                    return;
                 }
                 continue; // Select a victim shard again.
             }
 
-            item = _get_entry(e, struct bcache_item, list_elem);
+            elem = list_pop_back(&bshard->cleanBlocks);
+            item = reinterpret_cast<BlockCacheItem *>(elem);
 #ifdef __BCACHE_SECOND_CHANCE
             // repeat until zero-score item is found
-            if (item->score == 0) {
+            if (item->getScore() == 0) {
                 found_victim_shard = true;
                 break;
             } else {
                 // give second chance to the item
-                item->score--;
-                list_push_front(&bshard->cleanlist, &item->list_elem);
+                item->setScore(item->getScore() - 1);
+                list_push_front(&bshard->cleanBlocks, &item->list_elem);
                 spin_unlock(&bshard->lock);
             }
 #else
@@ -725,233 +728,162 @@ static struct list_elem * _bcache_evict(struct fnamedic_item *curfile)
         if (!found_victim_shard) {
             // We couldn't find any non-empty shards even after 'num_shards'
             // attempts.
-            // The file is *likely* empty. Note that it is OK to return NULL
+            // The file is *likely* empty. Note that it is OK to return here
             // even if the file is not empty because the caller will retry again.
-            atomic_decr_uint32_t(&victim->ref_count);
-            return NULL;
+            victim->refCount--;
+            return;
         }
 
-        atomic_decr_uint64_t(&victim->nitems);
-        // remove from hash and insert into freelist
-        hash_remove(&bshard->hashtable, &item->hash_elem);
-        // add to freelist
-        _bcache_release_freeblock(item);
+        victim->numItems--;
+        // remove from the shard block list
+        bshard->allBlocks.erase(item->getBid());
+        // add to the free block list
+        addToFreeBlockList(item);
         n_evict++;
 
         spin_unlock(&bshard->lock);
 
-        if (atomic_get_uint64_t(&victim->nitems) == 0) {
+        if (victim->numItems.load() == 0) {
             break;
         }
     }
 
-    atomic_decr_uint32_t(&victim->ref_count);
-    return &item->list_elem;
+    victim->refCount--;
 }
 
-static struct fnamedic_item * _fname_create(struct filemgr *file) {
+FileBlockCache* BlockCacheManager::createFileBlockCache(FileMgr *file) {
     // TODO: we MUST NOT directly read file sturcture
 
-    struct fnamedic_item *fname_new;
-    // Before we create a new filename entry, garbage collect zombies
-    _garbage_collect_zombie_fnames();
-    fname_new = (struct fnamedic_item *)malloc(sizeof(struct fnamedic_item));
+    // Before we create a new file block cache, garbage collect zombies
+    cleanUpInvalidFileBlockCaches();
 
-    fname_new->filename_len = strlen(file->filename);
-    fname_new->filename = (char *)malloc(fname_new->filename_len + 1);
-    memcpy(fname_new->filename, file->filename, fname_new->filename_len);
-    fname_new->filename[fname_new->filename_len] = 0;
-
-    // calculate hash value
-    fname_new->hash = get_checksum(reinterpret_cast<const uint8_t*>(fname_new->filename),
-                                   fname_new->filename_len,
-                                   file->crc_mode);
-    fname_new->curfile = file;
-    atomic_init_uint64_t(&fname_new->nvictim, 0);
-    atomic_init_uint64_t(&fname_new->nitems, 0);
-    atomic_init_uint64_t(&fname_new->nimmutable, 0);
-    atomic_init_uint32_t(&fname_new->ref_count, 0);
-    atomic_init_uint64_t(&fname_new->access_timestamp, 0);
-    if (file->config->num_bcache_shards) {
-        fname_new->num_shards = file->config->num_bcache_shards;
+    size_t num_shards;
+    if (file->getConfig()->getNumBcacheShards()) {
+        num_shards = file->getConfig()->getNumBcacheShards();
     } else {
-        fname_new->num_shards = DEFAULT_NUM_BCACHE_PARTITIONS;
+        num_shards = DEFAULT_NUM_BCACHE_PARTITIONS;
     }
+
+    std::string file_name(file->getFileName());
+    FileBlockCache *fcache = new FileBlockCache(file_name, file, num_shards);
+
     // For random eviction among shards
     randomize();
 
-    fname_new->shards = (bcache_shard *)
-        malloc(sizeof(struct bcache_shard) * fname_new->num_shards);
-    size_t i = 0;
-    for (; i < fname_new->num_shards; ++i) {
-        // initialize tree
-        avl_init(&fname_new->shards[i].tree, NULL);
-        avl_init(&fname_new->shards[i].tree_idx, NULL);
-        // initialize clean list
-        list_init(&fname_new->shards[i].cleanlist);
-        // initialize hash table
-        hash_init(&fname_new->shards[i].hashtable, BCACHE_NBUCKET,
-                  _bcache_hash, _bcache_cmp);
-        spin_init(&fname_new->shards[i].lock);
+    // insert into a file map
+    fileMap.insert(std::make_pair(file_name, fcache));
+    file->setBCache(fcache);
+
+    if (writer_lock(&fileListLock) == 0) {
+        fileList.push_back(fcache);
+        writer_unlock(&fileListLock);
+    } else {
+        fprintf(stderr, "Error in BlockCacheManager::createFileBlockCache(): "
+                        "Failed to acquire WriterLock on a file list lock!\n");
     }
 
-    // insert into fname dictionary
-    hash_insert(&fnamedic, &fname_new->hash_elem);
-    file->bcache = fname_new;
-
-    rw_spin_write_lock(&filelist_lock);
-    if (num_files == file_array_capacity) {
-        file_array_capacity *= 2;
-        file_list = (struct fnamedic_item **) realloc(file_list, file_array_capacity);
-    }
-    file_list[num_files++] = fname_new;
-    rw_spin_write_unlock(&filelist_lock);
-
-    return fname_new;
+    return fcache;
 }
 
-static bool _fname_try_free(struct fnamedic_item *fname)
-{
+bool BlockCacheManager::prepareDeallocationForFileBlockCache(FileBlockCache *fcache) {
     bool ret = true;
 
-    rw_spin_write_lock(&filelist_lock);
-    // Remove from the file list array
-    bool found = false;
-    for (size_t i = 0; i < num_files; ++i) {
-        if (file_list[i] == fname) {
-            found = true;
+    if (writer_lock(&fileListLock) == 0) {
+        // Remove from the global file list
+        bool found = false;
+        for (auto entry = fileList.begin(); entry != fileList.end(); ++entry) {
+            if (*entry == fcache) {
+                fileList.erase(entry);
+                found = true;
+                break;
+            }
         }
-        if (found && (i+1 < num_files)) {
-            file_list[i] = file_list[i+1];
+        if (!found) {
+            writer_unlock(&fileListLock);
+            fprintf(stderr, "Error: a file block cache instance for a file '%s' can't be "
+                    "found in the global file list.\n", fcache->getFileName().c_str());
+            return false;
         }
-    }
-    if (!found) {
-        rw_spin_write_unlock(&filelist_lock);
-        DBG("Error: fnamedic_item instance for a file '%s' can't be "
-            "found in the buffer cache's file list.\n", fname->filename);
-        return false;
+
+        if (fcache->getRefCount() != 0) {
+            // The file block cache is currently accessed by another thread for eviction
+            fileZombies.push_front(fcache);
+            ret = false; // Delay deletion
+        }
+
+        writer_unlock(&fileListLock);
+    } else {
+        ret = false;
+        fprintf(stderr, "Error in BlockCacheManager::prepareDeallocationForFileBlockCache(): "
+                        "Failed to acquire WriterLock on the global file list!\n");
     }
 
-    file_list[num_files - 1] = NULL;
-    --num_files;
-    if (atomic_get_uint32_t(&fname->ref_count) != 0) {
-        // This item is a victim by another thread's _bcache_evict()
-        list_push_front(&file_zombies, &fname->le);
-        ret = false; // Delay deletion
-    }
-
-    rw_spin_write_unlock(&filelist_lock);
     return ret;
 }
 
-static void _fname_free(struct fnamedic_item *fname)
-{
-    // file must be empty
-    if (!_file_empty(fname)) {
-        DBG("Warning: failed to free fnamedic_item instance for a file '%s' "
-            "because the fnamedic_item instance is not empty!\n",
-            fname->filename);
-        return;
-    }
-    uint32_t ref_count = atomic_get_uint32_t(&fname->ref_count);
-    if (ref_count != 0) {
-        DBG("Warning: failed to free fnamedic_item instance for a file '%s' "
-            "because its ref counter is not zero!\n",
-            fname->filename);
-        return;
-    }
-
-    // free hash
-    size_t i = 0;
-    for (; i < fname->num_shards; ++i) {
-        hash_free(&fname->shards[i].hashtable);
-        spin_destroy(&fname->shards[i].lock);
-    }
-
-    free(fname->shards);
-    free(fname->filename);
-    atomic_destroy_uint32_t(&fname->ref_count);
-    atomic_destroy_uint64_t(&fname->nvictim);
-    atomic_destroy_uint64_t(&fname->nitems);
-    atomic_destroy_uint64_t(&fname->nimmutable);
-    atomic_destroy_uint64_t(&fname->access_timestamp);
-    free(fname);
-}
-
-INLINE void _bcache_set_score(struct bcache_item *item)
-{
+void BlockCacheManager::setScore(BlockCacheItem &item) {
 #ifdef __CRC32
     uint8_t marker;
 
     // set PTR and get block MARKER
-    marker = *((uint8_t*)(item->addr) + bcache_blocksize-1);
+    marker = *(reinterpret_cast<uint8_t *>(item.getBlockAddr()) + blockSize - 1);
     if (marker == BLK_MARKER_BNODE ) {
         // b-tree node .. set item's score to 1
-        item->score = 1;
+        item.setScore(1);
     } else {
-        item->score = 0;
+        item.setScore(0);
     }
 #endif
 }
 
-int bcache_read(struct filemgr *file, bid_t bid, void *buf)
-{
-    struct hash_elem *h;
-    struct bcache_item *item;
-    struct bcache_item query;
-    struct fnamedic_item *fname;
+int BlockCacheManager::read(FileMgr *file,
+                            bid_t bid,
+                            void *buf) {
+    FileBlockCache *fcache;
 
-    // Note that we don't need to grab bcache_lock here as the block cache
+    // Note that we don't need to grab bcacheLock here as the block cache
     // is already created and binded when the file is created or opened for
     // the first time.
-    fname = file->bcache;
+    fcache = file->getBCache();
 
-    if (fname) {
+    if (fcache) {
         // file exists
-        // set query
-        query.bid = bid;
-        // Update the access timestamp.
-        struct timeval tp;
-        gettimeofday(&tp, NULL); // TODO: Need to implement a better way of
-                                 // getting the timestamp to avoid the overhead of
-                                 // gettimeofday()
-        atomic_store_uint64_t(&fname->access_timestamp,
-                              (uint64_t) (tp.tv_sec * 1000000 + tp.tv_usec));
+        fcache->setAccessTimestamp(gethrtime() / 1000000); // access timestamp in ms
 
-        size_t shard_num = bid % fname->num_shards;
-        spin_lock(&fname->shards[shard_num].lock);
+        size_t shard_num = bid % fcache->getNumShards();
+        spin_lock(&fcache->shards[shard_num]->lock);
 
         // search shard hash table
-        h = hash_find(&fname->shards[shard_num].hashtable, &query.hash_elem);
-        if (h) {
+        auto block_entry = fcache->shards[shard_num]->allBlocks.find(bid);
+        if (block_entry != fcache->shards[shard_num]->allBlocks.end()) {
             // cache hit
-            item = _get_entry(h, struct bcache_item, hash_elem);
-            if (item->flag & BCACHE_FREE) {
-                spin_unlock(&fname->shards[shard_num].lock);
+            BlockCacheItem *item = block_entry->second;
+            if (item->getFlag() & BCACHE_FREE) {
+                spin_unlock(&fcache->shards[shard_num]->lock);
                 DBG("Warning: failed to read the buffer cache entry for a file '%s' "
                     "because the entry belongs to the free list!\n",
-                    file->filename);
+                    file->getFileName());
                 return 0;
             }
 
             // move the item to the head of list if the block is clean
             // (don't care if the block is dirty)
-            if (!(item->flag & BCACHE_DIRTY)) {
+            if (!(item->getFlag() & BCACHE_DIRTY)) {
                 // TODO: Scanning the list would cause some overhead. We need to devise
                 // the better data structure to provide a fast lookup for the clean list.
-                list_remove(&fname->shards[shard_num].cleanlist, &item->list_elem);
-                list_push_front(&fname->shards[shard_num].cleanlist, &item->list_elem);
+                list_remove(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
+                list_push_front(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
             }
 
-            memcpy(buf, item->addr, bcache_blocksize);
-            _bcache_set_score(item);
+            memcpy(buf, item->getBlockAddr(), blockSize);
+            setScore(*item);
 
-            spin_unlock(&fname->shards[shard_num].lock);
+            spin_unlock(&fcache->shards[shard_num]->lock);
 
-            return bcache_blocksize;
+            return blockSize;
         } else {
             // cache miss
-            spin_unlock(&fname->shards[shard_num].lock);
+            spin_unlock(&fcache->shards[shard_num]->lock);
         }
     }
 
@@ -959,285 +891,252 @@ int bcache_read(struct filemgr *file, bid_t bid, void *buf)
     return 0;
 }
 
-bool bcache_invalidate_block(struct filemgr *file, bid_t bid)
-{
-    struct hash_elem *h;
-    struct bcache_item *item;
-    struct bcache_item query;
-    struct fnamedic_item *fname;
+bool BlockCacheManager::invalidateBlock(FileMgr *file,
+                                        bid_t bid) {
+    FileBlockCache *fcache;
     bool ret = false;
 
     // Note that we don't need to grab bcache_lock here as the block cache
     // is already created and binded when the file is created or opened for
     // the first time.
-    fname = file->bcache;
+    fcache = file->getBCache();
 
-    if (fname) {
+    if (fcache) {
         // file exists
-        // set query
-        query.bid = bid;
         // Update the access timestamp.
-        struct timeval tp;
-        gettimeofday(&tp, NULL);
-        atomic_store_uint64_t(&fname->access_timestamp,
-                              (uint64_t) (tp.tv_sec * 1000000 + tp.tv_usec));
+        fcache->setAccessTimestamp(gethrtime() / 1000000);
 
-        size_t shard_num = bid % fname->num_shards;
-        spin_lock(&fname->shards[shard_num].lock);
+        size_t shard_num = bid % fcache->getNumShards();
+        spin_lock(&fcache->shards[shard_num]->lock);
 
         // search BHASH
-        h = hash_find(&fname->shards[shard_num].hashtable, &query.hash_elem);
-        if (h) {
+        auto block_entry = fcache->shards[shard_num]->allBlocks.find(bid);
+        if (block_entry != fcache->shards[shard_num]->allBlocks.end()) {
             // cache hit
-            item = _get_entry(h, struct bcache_item, hash_elem);
-            if (item->flag & BCACHE_FREE) {
-                spin_unlock(&fname->shards[shard_num].lock);
+            BlockCacheItem *item = block_entry->second;
+
+            if (item->getFlag() & BCACHE_FREE) {
+                spin_unlock(&fcache->shards[shard_num]->lock);
                 DBG("Warning: failed to invalidate the buffer cache entry for a file '%s' "
                     "because the entry belongs to the free list!\n",
-                    file->filename);
+                    file->getFileName());
                 return false;
             }
 
-            if (!(item->flag & BCACHE_DIRTY)) {
-                atomic_decr_uint64_t(&fname->nitems);
+            if (!(item->getFlag() & BCACHE_DIRTY)) {
+                fcache->numItems--;
                 // only for clean blocks
-                // remove from hash and insert into freelist
-                hash_remove(&fname->shards[shard_num].hashtable, &item->hash_elem);
-                // remove from clean list
-                list_remove(&fname->shards[shard_num].cleanlist, &item->list_elem);
-                spin_unlock(&fname->shards[shard_num].lock);
+                // remove from the shard block list
+                fcache->shards[shard_num]->allBlocks.erase(bid);
+                // remove from the shard clean list
+                list_remove(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
+                spin_unlock(&fcache->shards[shard_num]->lock);
 
-                // add to freelist
-                _bcache_release_freeblock(item);
+                // add the block to the global free list
+                addToFreeBlockList(item);
                 ret = true;
             } else {
-                item->flag |= BCACHE_IMMUTABLE; // (stale index node block)
-                atomic_incr_uint64_t(&fname->nimmutable);
-                spin_unlock(&fname->shards[shard_num].lock);
+                // stale index node block
+                uint8_t flag = item->getFlag() | BCACHE_IMMUTABLE;
+                item->setFlag(flag);
+                fcache->numImmutables++;
+                spin_unlock(&fcache->shards[shard_num]->lock);
             }
         } else {
             // cache miss
-            spin_unlock(&fname->shards[shard_num].lock);
+            spin_unlock(&fcache->shards[shard_num]->lock);
         }
     }
     return ret;
 }
 
-int bcache_write(struct filemgr *file,
-                 bid_t bid,
-                 void *buf,
-                 bcache_dirty_t dirty,
-                 bool final_write)
-{
-    struct hash_elem *h = NULL;
-    struct bcache_item *item;
-    struct bcache_item query;
-    struct fnamedic_item *fname_new;
+int BlockCacheManager::write(FileMgr *file,
+                             bid_t bid,
+                             void *buf,
+                             bcache_dirty_t dirty,
+                             bool final_write) {
+    BlockCacheItem *item;
+    FileBlockCache *fcache;
 
-    fname_new = file->bcache;
-    if (fname_new == NULL) {
-        spin_lock(&bcache_lock);
-        fname_new = file->bcache;
-        if (fname_new == NULL) {
-            // filename doesn't exist in filename dictionary .. create
-            fname_new = _fname_create(file);
+    fcache = file->getBCache();
+    if (fcache == NULL) {
+        spin_lock(&bcacheLock);
+        fcache = file->getBCache();
+        if (fcache == NULL) {
+            // A file block cache doesn't exist in the block cache manager.
+            // Create it.
+            fcache = createFileBlockCache(file);
         }
-        spin_unlock(&bcache_lock);
+        spin_unlock(&bcacheLock);
     }
 
     // Update the access timestamp.
-    struct timeval tp;
-    gettimeofday(&tp, NULL);
-    atomic_store_uint64_t(&fname_new->access_timestamp,
-                          (uint64_t) (tp.tv_sec * 1000000 + tp.tv_usec));
+    fcache->setAccessTimestamp(gethrtime() / 1000000);
 
-    size_t shard_num = bid % fname_new->num_shards;
-    // set query
-    query.bid = bid;
+    size_t shard_num = bid % fcache->getNumShards();
+    spin_lock(&fcache->shards[shard_num]->lock);
 
-    spin_lock(&fname_new->shards[shard_num].lock);
-
-    // search hash table
-    h = hash_find(&fname_new->shards[shard_num].hashtable, &query.hash_elem);
-    if (h == NULL) {
+    // search shard hash table
+    auto block_entry = fcache->shards[shard_num]->allBlocks.find(bid);
+    if (block_entry == fcache->shards[shard_num]->allBlocks.end()) {
         // cache miss
-        // get a free block
-        while ((item = _bcache_alloc_freeblock()) == NULL) {
+        // get a block from the free list
+        while ((item = getFreeBlock()) == NULL) {
             // no free block .. perform eviction
-            spin_unlock(&fname_new->shards[shard_num].lock);
-
-            _bcache_evict(fname_new);
-
-            spin_lock(&fname_new->shards[shard_num].lock);
+            spin_unlock(&fcache->shards[shard_num]->lock);
+            performEviction();
+            spin_lock(&fcache->shards[shard_num]->lock);
         }
 
         // re-search hash table
-        h = hash_find(&fname_new->shards[shard_num].hashtable, &query.hash_elem);
-        if (h == NULL) {
+        block_entry = fcache->shards[shard_num]->allBlocks.find(bid);
+        if (block_entry == fcache->shards[shard_num]->allBlocks.end()) {
             // insert into hash table
-            item->bid = bid;
-            item->flag = BCACHE_FREE;
-            hash_insert(&fname_new->shards[shard_num].hashtable, &item->hash_elem);
-            h = &item->hash_elem;
+            item->setBid(bid);
+            item->setFlag(BCACHE_FREE);
+            fcache->shards[shard_num]->allBlocks.insert(std::make_pair(item->getBid(),
+                                                                       item));
         } else {
             // insert into freelist again
-            _bcache_release_freeblock(item);
-            item = _get_entry(h, struct bcache_item, hash_elem);
+            addToFreeBlockList(item);
+            item = block_entry->second;
         }
     } else {
-        item = _get_entry(h, struct bcache_item, hash_elem);
+        item = block_entry->second;
     }
 
-    fdb_assert(h, h, NULL);
+    fdb_assert(item, item, NULL);
 
-    if (item->flag & BCACHE_FREE) {
-        atomic_incr_uint64_t(&fname_new->nitems);
+    if (item->getFlag() & BCACHE_FREE) {
+        fcache->numItems++;
     }
 
     // remove from the list if the block is in clean list
-    if (!(item->flag & BCACHE_DIRTY) && !(item->flag & BCACHE_FREE)) {
-        list_remove(&fname_new->shards[shard_num].cleanlist, &item->list_elem);
+    if (!(item->getFlag() & BCACHE_DIRTY) && !(item->getFlag() & BCACHE_FREE)) {
+        list_remove(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
     }
-    item->flag &= ~BCACHE_FREE;
+    item->setFlag(item->getFlag() & ~BCACHE_FREE);
 
     if (dirty == BCACHE_REQ_DIRTY) {
         // DIRTY request
         // to avoid re-insert already existing item into tree
-        if (!(item->flag & BCACHE_DIRTY)) {
+        if (!(item->getFlag() & BCACHE_DIRTY)) {
             // dirty block
             // insert into tree
-            struct dirty_item *ditem;
-            uint8_t marker;
-
-            ditem = (struct dirty_item *)
-                    mempool_alloc(sizeof(struct dirty_item));
-            ditem->item = item;
-
-            marker = *((uint8_t*)buf + bcache_blocksize-1);
+            uint8_t marker = *((uint8_t*)buf + blockSize - 1);
             if (marker == BLK_MARKER_BNODE) {
                 // b-tree node
-                avl_insert(&fname_new->shards[shard_num].tree_idx, &ditem->avl, _dirty_cmp);
+                fcache->shards[shard_num]->dirtyIndexBlocks.insert(
+                    std::make_pair(item->getBid(), item));
             } else {
                 if (final_write) {
-                    item->flag |= BCACHE_IMMUTABLE; // (fully written doc block)
-                    atomic_incr_uint64_t(&fname_new->nimmutable);
+                    // (fully written doc block)
+                    item->setFlag(item->getFlag() | BCACHE_IMMUTABLE);
+                    fcache->numImmutables++;
                 }
-                avl_insert(&fname_new->shards[shard_num].tree, &ditem->avl,
-                           _dirty_cmp);
+                fcache->shards[shard_num]->dirtyDataBlocks.insert(
+                    std::make_pair(item->getBid(), item));
             }
         }
-        item->flag |= BCACHE_DIRTY;
+        item->setFlag(item->getFlag() | BCACHE_DIRTY);
     } else {
         // CLEAN request
         // insert into clean list only when it was originally clean
-        if (!(item->flag & BCACHE_DIRTY)) {
-            list_push_front(&fname_new->shards[shard_num].cleanlist, &item->list_elem);
-            item->flag &= ~(BCACHE_DIRTY);
+        if (!(item->getFlag() & BCACHE_DIRTY)) {
+            list_push_front(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
+            item->setFlag(item->getFlag() & ~(BCACHE_DIRTY));
         }
     }
 
-    memcpy(item->addr, buf, bcache_blocksize);
-    _bcache_set_score(item);
+    memcpy(item->getBlockAddr(), buf, blockSize);
+    setScore(*item);
 
-    spin_unlock(&fname_new->shards[shard_num].lock);
+    spin_unlock(&fcache->shards[shard_num]->lock);
 
-    return bcache_blocksize;
+    return blockSize;
 }
 
-int bcache_write_partial(struct filemgr *file,
-                         bid_t bid,
-                         void *buf,
-                         size_t offset,
-                         size_t len,
-                         bool final_write)
-{
-    struct hash_elem *h;
-    struct bcache_item *item;
-    struct bcache_item query;
-    struct fnamedic_item *fname_new;
+int BlockCacheManager::writePartial(FileMgr *file,
+                                    bid_t bid,
+                                    void *buf,
+                                    size_t offset,
+                                    size_t len,
+                                    bool final_write) {
+    BlockCacheItem *item = NULL;
+    FileBlockCache *fcache = NULL;
 
-    fname_new = file->bcache;
-    if (fname_new == NULL) {
-        spin_lock(&bcache_lock);
-        fname_new = file->bcache;
-        if (fname_new == NULL) {
-            // filename doesn't exist in filename dictionary .. create
-            fname_new = _fname_create(file);
+    fcache = file->getBCache();
+    if (fcache == NULL) {
+        spin_lock(&bcacheLock);
+        fcache = file->getBCache();
+        if (fcache == NULL) {
+            // A file block cache doesn't exist in the block cache manager.
+            // Create it.
+            fcache = createFileBlockCache(file);
         }
-        spin_unlock(&bcache_lock);
+        spin_unlock(&bcacheLock);
     }
 
     // Update the access timestamp.
-    struct timeval tp;
-    gettimeofday(&tp, NULL);
-    atomic_store_uint64_t(&fname_new->access_timestamp,
-                          (uint64_t) (tp.tv_sec * 1000000 + tp.tv_usec));
+    fcache->setAccessTimestamp(gethrtime() / 1000000);
 
-    size_t shard_num = bid % fname_new->num_shards;
-    // set query
-    query.bid = bid;
+    size_t shard_num = bid % fcache->getNumShards();
+    spin_lock(&fcache->shards[shard_num]->lock);
 
-    spin_lock(&fname_new->shards[shard_num].lock);
-
-    // search hash table
-    h = hash_find(&fname_new->shards[shard_num].hashtable, &query.hash_elem);
-    if (h == NULL) {
+    // search the shard block hashtable
+    auto block_entry = fcache->shards[shard_num]->allBlocks.find(bid);
+    if (block_entry == fcache->shards[shard_num]->allBlocks.end()) {
         // cache miss .. partial write fail .. return 0
-        spin_unlock(&fname_new->shards[shard_num].lock);
+        spin_unlock(&fcache->shards[shard_num]->lock);
         return 0;
-
     } else {
         // cache hit .. get the block
-        item = _get_entry(h, struct bcache_item, hash_elem);
+        item = block_entry->second;
     }
 
-    if (item->flag & BCACHE_FREE) {
+    if (item->getFlag() & BCACHE_FREE) {
         DBG("Warning: failed to write on the buffer cache entry for a file '%s' "
             "because the entry belongs to the free list!\n",
-            file->filename);
+            file->getFileName());
         return 0;
     }
 
     // check whether this is dirty block
-    // to avoid re-insert already existing item into tree
-    if (!(item->flag & BCACHE_DIRTY)) {
-        // this block was clean block
-        uint8_t marker;
-        struct dirty_item *ditem;
+    // to avoid re-inserting the existing item into the dirty block list
+    if (!(item->getFlag() & BCACHE_DIRTY)) {
+        // This block was a clean block. Remove it from the clean block list
+        list_remove(&fcache->shards[shard_num]->cleanBlocks, &item->list_elem);
 
-        // remove from clean list
-        list_remove(&fname_new->shards[shard_num].cleanlist, &item->list_elem);
-
-        ditem = (struct dirty_item *)mempool_alloc(sizeof(struct dirty_item));
-        ditem->item = item;
-
-        // insert into tree
-        marker = *((uint8_t*)item->addr + bcache_blocksize-1);
+        // Insert into the dirty data or index block tree
+        uint8_t marker = *((uint8_t*)item->getBlockAddr() + blockSize - 1);
         if (marker == BLK_MARKER_BNODE ) {
             // b-tree node
-            avl_insert(&fname_new->shards[shard_num].tree_idx, &ditem->avl, _dirty_cmp);
+            fcache->shards[shard_num]->dirtyIndexBlocks.insert(
+                std::make_pair(item->getBid(), item));
         } else {
-            avl_insert(&fname_new->shards[shard_num].tree, &ditem->avl,
-                       _dirty_cmp);
+            fcache->shards[shard_num]->dirtyDataBlocks.insert(
+                    std::make_pair(item->getBid(), item));
             if (final_write) {
-                item->flag |= BCACHE_IMMUTABLE; // (fully written doc block)
-                atomic_incr_uint64_t(&fname_new->nimmutable);
+                // (fully written doc block)
+                item->setFlag(item->getFlag() | BCACHE_IMMUTABLE);
+                fcache->numImmutables++;
             }
         }
-    } else if (!(item->flag & BCACHE_IMMUTABLE)) {
+    } else if (!(item->getFlag() & BCACHE_IMMUTABLE)) {
         if (final_write) {
-            item->flag |= BCACHE_IMMUTABLE; // (fully written doc block)
-            atomic_incr_uint64_t(&fname_new->nimmutable);
+            // (fully written doc block)
+            item->setFlag(item->getFlag() | BCACHE_IMMUTABLE);
+            fcache->numImmutables++;
         }
     }
 
     // always set this block as dirty
-    item->flag |= BCACHE_DIRTY;
+    item->setFlag(item->getFlag() | BCACHE_DIRTY);
 
-    memcpy((uint8_t *)(item->addr) + offset, buf, len);
-    _bcache_set_score(item);
+    memcpy((uint8_t *)(item->getBlockAddr()) + offset, buf, len);
+    setScore(*item);
 
-    spin_unlock(&fname_new->shards[shard_num].lock);
+    spin_unlock(&fcache->shards[shard_num]->lock);
 
     return len;
 }
@@ -1245,192 +1144,251 @@ int bcache_write_partial(struct filemgr *file,
 // flush and synchronize a batch of contiguous dirty immutable blocks in file
 // dirty blocks will be changed to clean blocks (not discarded)
 // Note: This function can be invoked as part of background flushing
-fdb_status bcache_flush_immutable(struct filemgr *file)
-{
-    struct fnamedic_item *fname_item;
+fdb_status BlockCacheManager::flushImmutable(FileMgr *file) {
+    FileBlockCache *fcache;
     fdb_status status = FDB_RESULT_SUCCESS;
-    fname_item = file->bcache;
-    if (fname_item) {
-        status = _flush_dirty_blocks(fname_item, true, true, true);
+    fcache = file->getBCache();
+
+    if (fcache) {
+        status = flushDirtyBlocks(fcache, true, true, true);
     }
     return status;
 }
 
 // remove all dirty blocks of the FILE
 // (they are only discarded and not written back)
-void bcache_remove_dirty_blocks(struct filemgr *file)
-{
-    struct fnamedic_item *fname_item;
+void BlockCacheManager::removeDirtyBlocks(FileMgr *file) {
+    FileBlockCache *fcache;
+    fcache = file->getBCache();
 
-    fname_item = file->bcache;
-
-    if (fname_item) {
+    if (fcache) {
         // Note that this function is only invoked as part of database file close or
         // removal when there are no database handles for a given file. Therefore,
         // we don't need to grab all the shard locks at once.
 
         // remove all dirty blocks
-        _flush_dirty_blocks(fname_item, false, true, false);
+        flushDirtyBlocks(fcache, false, true, false);
     }
 }
 
 // remove all clean blocks of the FILE
-void bcache_remove_clean_blocks(struct filemgr *file)
-{
-    struct list_elem *e;
-    struct bcache_item *item;
-    struct fnamedic_item *fname_item;
+void BlockCacheManager::removeCleanBlocks(FileMgr *file) {
+    struct list_elem *elem;
+    BlockCacheItem *item;
+    FileBlockCache *fcache;
 
-    fname_item = file->bcache;
+    fcache = file->getBCache();
 
-    if (fname_item) {
+    if (fcache) {
         // Note that this function is only invoked as part of database file close or
         // removal when there are no database handles for a given file. Therefore,
         // we don't need to grab all the shard locks at once.
 
         // remove all clean blocks from each shard in a file.
         size_t i = 0;
-        for (; i < fname_item->num_shards; ++i) {
-            spin_lock(&fname_item->shards[i].lock);
-            e = list_begin(&fname_item->shards[i].cleanlist);
-            while(e){
-                item = _get_entry(e, struct bcache_item, list_elem);
-                // remove from clean list
-                e = list_remove(&fname_item->shards[i].cleanlist, e);
-                // remove from hash table
-                hash_remove(&fname_item->shards[i].hashtable, &item->hash_elem);
-                // insert into free list
-                _bcache_release_freeblock(item);
+        for (; i < fcache->getNumShards(); ++i) {
+            spin_lock(&fcache->shards[i]->lock);
+            elem = list_begin(&fcache->shards[i]->cleanBlocks);
+            while (elem) {
+                item = reinterpret_cast<BlockCacheItem *>(elem);
+                // remove from clean block list
+                elem = list_remove(&fcache->shards[i]->cleanBlocks, elem);
+                // remove from the all block list
+                fcache->shards[i]->allBlocks.erase(item->getBid());
+                fcache->numItems--;
+                // insert into the free block list
+                addToFreeBlockList(item);
             }
-            spin_unlock(&fname_item->shards[i].lock);
+            spin_unlock(&fcache->shards[i]->lock);
         }
     }
 }
 
-// remove file from filename dictionary
+// Remove a file block cache from the file block cache list
 // MUST sure that there is no dirty block belongs to this FILE
 // (or memory leak occurs)
-bool bcache_remove_file(struct filemgr *file)
-{
+bool BlockCacheManager::removeFile(FileMgr *file) {
     bool rv = false;
-    struct fnamedic_item *fname_item;
+    FileBlockCache *fcache;
 
-    // Before proceeding with deletion, garbage collect zombie files
-    _garbage_collect_zombie_fnames();
-    fname_item = file->bcache;
+    // Before proceeding with deletion, garbage collect zombie file cache instances
+    cleanUpInvalidFileBlockCaches();
+    fcache = file->getBCache();
 
-    if (fname_item) {
+    if (fcache) {
         // acquire lock
-        spin_lock(&bcache_lock);
-        // file must be empty
-        if (!_file_empty(fname_item)) {
-            spin_unlock(&bcache_lock);
-            DBG("Warning: failed to remove fnamedic_item instance for a file '%s' "
-                "because the fnamedic_item instance is not empty!\n",
-                file->filename);
+        spin_lock(&bcacheLock);
+        // file block cache must be empty
+        if (!fcache->empty()) {
+            spin_unlock(&bcacheLock);
+            DBG("Warning: failed to remove a file cache instance for a file '%s' "
+                "because the file cache instance is not empty!\n",
+                file->getFileName());
             return rv;
         }
 
-        // remove from fname dictionary hash table
-        hash_remove(&fnamedic, &fname_item->hash_elem);
-        spin_unlock(&bcache_lock);
+        // remove from the file block cache map
+        fileMap.erase(std::string(file->getFileName()));
+        spin_unlock(&bcacheLock);
 
         // We don't need to grab the file buffer cache's partition locks
         // at once because this function is only invoked when there are
         // no database handles that access the file.
-        if (_fname_try_free(fname_item)) {
-            _fname_free(fname_item); // no other callers accessing this file
+        if (prepareDeallocationForFileBlockCache(fcache)) {
+            freeFileBlockCache(fcache); // no other callers accessing this file
             rv = true;
-        } // else fnamedic_item is in use by _bcache_evict. Deletion delayed
+        } // Otherwise, a file block cache is in use by eviction. Deletion delayed
     }
     return rv;
 }
 
 // flush and synchronize all dirty blocks of the FILE
 // dirty blocks will be changed to clean blocks (not discarded)
-fdb_status bcache_flush(struct filemgr *file)
-{
-    struct fnamedic_item *fname_item;
+fdb_status BlockCacheManager::flush(FileMgr *file) {
+    FileBlockCache *fcache;
     fdb_status status = FDB_RESULT_SUCCESS;
 
-    fname_item = file->bcache;
+    fcache = file->getBCache();
 
-    if (fname_item) {
+    if (fcache) {
         // Note that this function is invoked as part of a commit operation while
         // the filemgr's lock is already grabbed by a committer.
         // Therefore, we don't need to grab all the shard locks at once.
-        status = _flush_dirty_blocks(fname_item, true, true, false);
+        status = flushDirtyBlocks(fcache, true, true, false);
     }
     return status;
 }
 
-void bcache_init(int nblock, int blocksize)
-{
-    int i;
-    struct bcache_item *item;
+BlockCacheManager::BlockCacheManager(uint64_t nblock, uint32_t blocksize) {
+    BlockCacheItem *item;
     uint8_t *block_ptr;
 
-    list_init(&freelist);
-    list_init(&file_zombies);
+    blockSize = blocksize;
+    flushUnit = BCACHE_FLUSH_UNIT;
+    numBlocks = nblock;
 
-    hash_init(&fnamedic, BCACHE_NDICBUCKET, _fname_hash, _fname_cmp);
+    spin_init(&bcacheLock);
+    spin_init(&freeListLock);
 
-    bcache_blocksize = blocksize;
-    bcache_flush_unit = BCACHE_FLUSH_UNIT;
-    bcache_nblock = nblock;
-    spin_init(&bcache_lock);
-    spin_init(&freelist_lock);
-    rw_spin_init(&filelist_lock);
-    freelist_count = 0;
+    list_init(&freeList);
 
-    num_files = 0;
-    file_array_capacity = 4096; // Initial capacity of file list array.
-    file_list = (fnamedic_item **) calloc(file_array_capacity, sizeof(fnamedic_item *));
+    int rv = init_rw_lock(&fileListLock);
+    if (rv != 0) {
+        fdb_log(NULL, FDB_RESULT_ALLOC_FAIL , "Error in bcache_init(): "
+                        "RW Lock initialization failed; ErrorCode: %d\n", rv);
+    }
+
+    freeListCount = 0;
+
     // Allocate entire buffer cache memory
-    block_ptr = (uint8_t *)malloc((uint64_t)bcache_blocksize * nblock);
-    buffercache_addr = block_ptr;
+    block_ptr = (uint8_t *) malloc((uint64_t) blockSize * numBlocks);
+    bufferCache = block_ptr;
 
-    for (i=0;i<nblock;++i){
-        item = (struct bcache_item *)malloc(sizeof(struct bcache_item));
-
-        item->bid = BLK_NOT_FOUND;
-        item->flag = 0x0 | BCACHE_FREE;
-        item->score = 0;
-        item->addr = block_ptr;
-        block_ptr += bcache_blocksize;
-
-        list_push_front(&freelist, &item->list_elem);
-        freelist_count++;
+    for (uint64_t i = 0; i < numBlocks; ++i) {
+        item = new BlockCacheItem(BLK_NOT_FOUND, block_ptr, (0x0 | BCACHE_FREE), 0);
+        block_ptr += blockSize;
+        list_push_front(&freeList, &item->list_elem);
+        freeListCount++;
     }
 }
 
-uint64_t bcache_get_num_free_blocks()
-{
-    return freelist_count;
+BlockCacheManager* BlockCacheManager::init(uint64_t nblock, uint32_t blocksize) {
+    BlockCacheManager* tmp = instance.load();
+    if (tmp == nullptr) {
+        // Ensure two threads don't both create an instance.
+        LockHolder lock(instanceMutex);
+        tmp = instance.load();
+        if (tmp == nullptr) {
+            tmp = new BlockCacheManager(nblock, blocksize);
+            instance.store(tmp);
+        }
+    }
+    return tmp;
 }
 
-uint64_t bcache_get_num_blocks(struct filemgr *file)
-{
-    struct fnamedic_item *fname = file->bcache;
-    if (fname) {
-        return atomic_get_uint64_t(&fname->nitems);
+BlockCacheManager* BlockCacheManager::getInstance() {
+    BlockCacheManager* cache_manager = instance.load();
+    if (cache_manager == nullptr) {
+        // Create the buffer cache manager with default configs.
+        return init(defaultCacheSize / defaultBlockSize, defaultBlockSize);
+    }
+    return cache_manager;
+}
+
+void BlockCacheManager::destroyInstance() {
+    LockHolder lock(instanceMutex);
+    BlockCacheManager* tmp = instance.load();
+    if (tmp != nullptr) {
+        delete tmp;
+        instance = nullptr;
+    }
+}
+
+BlockCacheManager::~BlockCacheManager() {
+    spin_lock(&freeListLock);
+    struct list_elem *elem = list_begin(&freeList);
+    while (elem) {
+        BlockCacheItem *item = reinterpret_cast<BlockCacheItem *>(elem);
+        elem = list_remove(&freeList, elem);
+        freeListCount--;
+        delete item;
+    }
+    spin_unlock(&freeListLock);
+
+    writer_lock(&fileListLock);
+    // Force clean zombie files if any
+    for (auto &fcache : fileZombies) {
+        freeFileBlockCache(fcache);
+    }
+    writer_unlock(&fileListLock);
+
+    // Free entire buffer cache memory
+    free(bufferCache);
+
+    spin_lock(&bcacheLock);
+    for (auto &file_entry : fileMap) {
+        freeFileBlockCache(file_entry.second, true);
+    }
+    spin_unlock(&bcacheLock);
+
+    spin_destroy(&bcacheLock);
+    spin_destroy(&freeListLock);
+
+    int rv = destroy_rw_lock(&fileListLock);
+    if (rv != 0) {
+        fprintf(stderr, "Error in destroying buffer cache: "
+                        "RW Lock's destruction failed; ErrorCode: %d\n", rv);
+    }
+}
+
+void BlockCacheManager::eraseFileHistory(FileMgr *file) {
+    LockHolder lock(instanceMutex);
+    BlockCacheManager* tmp = instance.load();
+    if (tmp) {
+        tmp->removeDirtyBlocks(file);
+        tmp->removeCleanBlocks(file);
+        tmp->removeFile(file);
+    }
+}
+
+uint64_t BlockCacheManager::getNumBlocks(FileMgr *file) {
+    FileBlockCache *fcache = file->getBCache();
+    if (fcache) {
+        return fcache->getNumItems();
     }
     return 0;
 }
 
-uint64_t bcache_get_num_immutable(struct filemgr *file)
-{
-    struct fnamedic_item *fname = file->bcache;
-    if (fname) {
-        return atomic_get_uint64_t(&fname->nimmutable);
+uint64_t BlockCacheManager::getNumImmutables(FileMgr *file) {
+    FileBlockCache *fcache = file->getBCache();
+    if (fcache) {
+        return fcache->getNumImmutables();
     }
     return 0;
-
 }
 
 // LCOV_EXCL_START
-void bcache_print_items()
-{
+void BlockCacheManager::printItems() {
     size_t n=1;
     size_t nfiles, nitems, nfileitems, nclean, ndirty;
     size_t scores[100], i, scores_local[100];
@@ -1442,11 +1400,9 @@ void bcache_print_items()
     docs = bnodes = 0;
     memset(scores, 0, sizeof(size_t)*100);
 
-    struct fnamedic_item *fname;
-    struct bcache_item *item;
-    struct dirty_item *dirty;
-    struct list_elem *ee;
-    struct avl_node *a;
+    FileBlockCache *fcache;
+    BlockCacheItem *item;
+    struct list_elem *elem;
 
     printf(" === Block cache statistics summary ===\n");
     printf("%3s %20s (%6s)(%6s)(c%6s d%6s)",
@@ -1459,26 +1415,24 @@ void bcache_print_items()
     }
     printf("\n");
 
-    for (size_t idx = 0; idx < num_files; ++idx) {
-        fname = file_list[idx];
+    for (auto &file_entry : fileList) {
+        fcache = file_entry;
         memset(scores_local, 0, sizeof(size_t)*100);
         nfileitems = nclean = ndirty = 0;
         docs_local = bnodes_local = 0;
 
         size_t i = 0;
-        for (; i < fname->num_shards; ++i) {
-            ee = list_begin(&fname->shards[i].cleanlist);
-            a = avl_first(&fname->shards[i].tree);
-
-            while(ee){
-                item = _get_entry(ee, struct bcache_item, list_elem);
-                scores[item->score]++;
-                scores_local[item->score]++;
+        for (; i < fcache->getNumShards(); ++i) {
+            elem = list_begin(&fcache->shards[i]->cleanBlocks);
+            while (elem) {
+                item = reinterpret_cast<BlockCacheItem *>(elem);
+                scores[item->getScore()]++;
+                scores_local[item->getScore()]++;
                 nitems++;
                 nfileitems++;
                 nclean++;
 #ifdef __CRC32
-                ptr = (uint8_t*)item->addr + bcache_blocksize - 1;
+                ptr = (uint8_t*)item->getBlockAddr() + blockSize - 1;
                 switch (*ptr) {
                 case BLK_MARKER_BNODE:
                     bnodes_local++;
@@ -1488,18 +1442,18 @@ void bcache_print_items()
                     break;
                 }
 #endif
-                ee = list_next(ee);
+                elem = list_next(elem);
             }
-            while(a){
-                dirty = _get_entry(a, struct dirty_item, avl);
-                item = dirty->item;
-                scores[item->score]++;
-                scores_local[item->score]++;
+
+            for (auto &data_entry : fcache->shards[i]->dirtyDataBlocks) {
+                item = data_entry.second;
+                scores[item->getScore()]++;
+                scores_local[item->getScore()]++;
                 nitems++;
                 nfileitems++;
                 ndirty++;
 #ifdef __CRC32
-                ptr = (uint8_t*)item->addr + bcache_blocksize - 1;
+                ptr = (uint8_t*)item->getBlockAddr() + blockSize - 1;
                 switch (*ptr) {
                 case BLK_MARKER_BNODE:
                     bnodes_local++;
@@ -1509,18 +1463,20 @@ void bcache_print_items()
                     break;
                 }
 #endif
-                a = avl_next(a);
             }
         }
 
         printf("%3d %20s (%6d)(%6d)(c%6d d%6d)",
-               (int)nfiles+1, fname->filename,
-               (int)atomic_get_uint64_t(&fname->nitems),
-               (int)atomic_get_uint64_t(&fname->nvictim),
-               (int)nclean, (int)ndirty);
-        printf("%6d%6d", (int)docs_local, (int)bnodes_local);
+               static_cast<int>(nfiles + 1),
+               fcache->getFileName().c_str(),
+               static_cast<int>(fcache->getNumItems()),
+               static_cast<int>(fcache->getNumVictims()),
+               static_cast<int>(nclean),
+               static_cast<int>(ndirty));
+        printf("%6d%6d", static_cast<int>(docs_local),
+                         static_cast<int>(bnodes_local));
         for (i=0;i<=n;++i){
-            printf("%6d ", (int)scores_local[i]);
+            printf("%6d ", static_cast<int>(scores_local[i]));
         }
         printf("\n");
 
@@ -1531,78 +1487,13 @@ void bcache_print_items()
     }
     printf(" ===\n");
 
-    printf("%d files %d items\n", (int)nfiles, (int)nitems);
+    printf("%d files %d items\n", static_cast<int>(nfiles),
+                                  static_cast<int>(nitems));
     for (i=0;i<=n;++i){
-        printf("[%d]: %d\n", (int)i, (int)scores[i]);
+        printf("[%d]: %d\n", static_cast<int>(i),
+                             static_cast<int>(scores[i]));
     }
-    printf("Documents: %d blocks\n", (int)docs);
-    printf("Index nodes: %d blocks\n", (int)bnodes);
+    printf("Documents: %d blocks\n", static_cast<int>(docs));
+    printf("Index nodes: %d blocks\n", static_cast<int>(bnodes));
 }
 // LCOV_EXCL_STOP
-
-// LCOV_EXCL_START
-INLINE void _bcache_free_bcache_item(struct hash_elem *h)
-{
-    struct bcache_item *item = _get_entry(h, struct bcache_item, hash_elem);
-    free(item);
-}
-// LCOV_EXCL_STOP
-
-// LCOV_EXCL_START
-INLINE void _bcache_free_fnamedic(struct hash_elem *h)
-{
-    size_t i = 0;
-    struct fnamedic_item *item;
-    item = _get_entry(h, struct fnamedic_item, hash_elem);
-
-    for (; i < item->num_shards; ++i) {
-        hash_free_active(&item->shards[i].hashtable, _bcache_free_bcache_item);
-        spin_destroy(&item->shards[i].lock);
-    }
-
-    free(item->shards);
-    free(item->filename);
-
-    atomic_destroy_uint32_t(&item->ref_count);
-    atomic_destroy_uint64_t(&item->nvictim);
-    atomic_destroy_uint64_t(&item->nitems);
-    atomic_destroy_uint64_t(&item->access_timestamp);
-    free(item);
-}
-// LCOV_EXCL_STOP
-
-void bcache_shutdown()
-{
-    struct bcache_item *item;
-    struct list_elem *e;
-
-    e = list_begin(&freelist);
-    while(e) {
-        item = _get_entry(e, struct bcache_item, list_elem);
-        e = list_remove(&freelist, e);
-        freelist_count--;
-        free(item);
-    }
-
-    // Force clean zombies if any
-    e = list_begin(&file_zombies);
-    while (e) {
-        struct fnamedic_item *fname = _get_entry(e, struct fnamedic_item, le);
-        e = list_remove(&file_zombies, e);
-        _fname_free(fname);
-    }
-    // Free the file list array
-    free(file_list);
-
-    // Free entire buffercache memory
-    free(buffercache_addr);
-
-    spin_lock(&bcache_lock);
-    hash_free_active(&fnamedic, _bcache_free_fnamedic);
-    spin_unlock(&bcache_lock);
-
-    spin_destroy(&bcache_lock);
-    spin_destroy(&freelist_lock);
-    rw_spin_destroy(&filelist_lock);
-}
-

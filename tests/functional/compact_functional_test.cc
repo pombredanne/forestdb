@@ -32,6 +32,8 @@
 #include "internal_types.h"
 #include "wal.h"
 #include "functional_util.h"
+#include "file_handle.h"
+#include "kvs_handle.h"
 
 struct cb_args {
     int n_moved_docs;
@@ -75,7 +77,7 @@ static fdb_compact_decision compaction_cb(fdb_file_handle *fhandle,
         TEST_CHK(s == FDB_RESULT_SUCCESS);
         fdb_doc_free(rdoc);
 
-        if (fhandle->root->config.multi_kv_instances) {
+        if (fhandle->getRootHandle()->config.multi_kv_instances) {
             TEST_CMP(kv_name, "db", 2);
         } else {
             TEST_CMP(kv_name, "default", 7);
@@ -732,6 +734,104 @@ void compact_reopen_with_iterator()
     TEST_RESULT("compact reopen with iterator");
 }
 
+void open_newfile_before_compact_done(void)
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, j, r;
+    int n = 20;
+    int num_kvs = 16;
+    fdb_file_handle *dbfile, *illegalfile;
+    fdb_kvs_handle **db = alca(fdb_kvs_handle *, num_kvs+1);
+    fdb_doc **doc = alca(fdb_doc*, n);
+    fdb_status status;
+
+    char keybuf[32], metabuf[32], bodybuf[32];
+    char kv_name[8];
+
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    fconfig.buffercache_size = 0;
+    fconfig.wal_threshold = 50;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.compaction_threshold = 0;
+    fconfig.block_reusing_threshold = 0;
+
+    // remove previous compact_test files
+    r = system(SHELL_DEL" compact_test* > errorlog.txt");
+    (void)r;
+
+    // open db
+    fdb_open(&dbfile, "./compact_test1", &fconfig);
+    for (r = 0; r < num_kvs; ++r) {
+        sprintf(kv_name, "kv%d", r);
+        fdb_kvs_open(dbfile, &db[r], kv_name, &kvs_config);
+    }
+
+   // ------- Setup test ----------------------------------
+   // insert first quarter of documents
+    for (i=0; i<n; i++){
+        sprintf(keybuf, "key%d", i);
+        sprintf(metabuf, "meta%d", i);
+        sprintf(bodybuf, "body%d", i);
+        fdb_doc_create(&doc[i], (void*)keybuf, strlen(keybuf),
+            (void*)metabuf, strlen(metabuf), (void*)bodybuf, strlen(bodybuf));
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[i]);
+        }
+    }
+
+    // commit with a manual WAL flush (these docs go into HB-trie)
+    fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+
+    // Update first quarter of documents again overwriting previous update..
+    for (j = 0; j < n; j++){
+        for (r = 0; r < num_kvs; ++r) {
+            fdb_set(db[r], doc[j]);
+        }
+    }
+
+    // commit again without a WAL flush (some of these docs remain in WAL)
+    fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+
+    for (r = 0; r < num_kvs; ++r) {
+        status = fdb_set_log_callback(db[r], logCallbackFunc,
+                                      (void *)"open_newfile_before_compact_done");
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    // It is illegal to open the new file before compaction is done in
+    // manual compaction mode..
+    status = fdb_open(&illegalfile, "./compact_test1.b", &fconfig);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_open(dbfile, &db[num_kvs], kv_name, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_compact(dbfile, "./compact_test1.b");
+    TEST_CHK(status == FDB_RESULT_EEXIST);
+
+    fdb_kvs_close(db[num_kvs]);
+
+    // close db file
+    fdb_close(dbfile);
+    fdb_close(illegalfile);
+
+    // free all documents
+    for (i=0;i<n;++i){
+        fdb_doc_free(doc[i]);
+    }
+
+    // free all resources
+    fdb_shutdown();
+
+    memleak_end();
+
+    TEST_RESULT("illegal new file opened before compaction done");
+}
+
 void estimate_space_upto_test(bool multi_kv)
 {
     TEST_INIT();
@@ -759,6 +859,7 @@ void estimate_space_upto_test(bool multi_kv)
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
+    fconfig.block_reusing_threshold = 0;
 
     // remove previous compact_test files
     r = system(SHELL_DEL" compact_test* > errorlog.txt");
@@ -858,13 +959,13 @@ void estimate_space_upto_test(bool multi_kv)
 
     if (!multi_kv) {
         size_t space_used2;
-        TEST_CHK(num_markers == 4);
+        TEST_CHK(num_markers == 5);
         space_used = fdb_estimate_space_used_from(dbfile, markers[1].marker);
         space_used2 = fdb_estimate_space_used_from(dbfile, markers[2].marker);
         TEST_CHK(space_used2 > space_used); // greater than space used by just 1
     } else {
         size_t space_used2;
-        TEST_CHK(num_markers == 8);
+        TEST_CHK(num_markers == 9);
         space_used = fdb_estimate_space_used_from(dbfile, markers[1].marker);
         space_used2 = fdb_estimate_space_used_from(dbfile, markers[2].marker);
         TEST_CHK(space_used2 > space_used); // greater than space used by just 1
@@ -920,6 +1021,9 @@ void compact_upto_test(bool multi_kv)
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_threshold = 0;
     fconfig.multi_kv_instances = multi_kv;
+    // since this test requires static number of markers,
+    // disable block reusing
+    fconfig.block_reusing_threshold = 0;
 
     // remove previous compact_test files
     r = system(SHELL_DEL" compact_test* > errorlog.txt");
@@ -1006,7 +1110,7 @@ void compact_upto_test(bool multi_kv)
     TEST_CHK(status == FDB_RESULT_SUCCESS);
 
     if (!multi_kv) {
-        TEST_CHK(num_markers == 4);
+        TEST_CHK(num_markers == 5);
         for (r = 0; (uint64_t)r < num_markers; ++r) {
             TEST_CHK(markers[r].num_kvs_markers == 1);
             TEST_CHK(markers[r].kvs_markers[0].seqnum ==
@@ -1024,7 +1128,7 @@ void compact_upto_test(bool multi_kv)
         // close snapshot
         fdb_kvs_close(snapshot);
     } else {
-        TEST_CHK(num_markers == 8);
+        TEST_CHK(num_markers == 9);
         for (r = 0; r < num_kvs; ++r) {
             TEST_CHK(markers[r].num_kvs_markers == num_kvs);
             for (i = 0; i < num_kvs; ++i) {
@@ -1759,6 +1863,13 @@ void compaction_daemon_test(size_t time_sec)
         }
     }
 
+    // Change the compaction interval to 60 secs.
+    status = fdb_set_daemon_compaction_interval(dbfile, 60);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    // Change the compaction interval back to 1 sec.
+    status = fdb_set_daemon_compaction_interval(dbfile, 1);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
     // perform manual compaction of auto-compact file
     status = fdb_compact(dbfile_non, NULL);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -1966,7 +2077,7 @@ void auto_compaction_with_custom_cmp_function()
 
     int i, r, n=10000;
     char keybuf[256], bodybuf[256];
-    uint64_t old_filesize;
+    uint64_t max_filesize = 0;
     fdb_file_handle *file;
     fdb_kvs_handle *db1, *db2, *db3;
     fdb_status status;
@@ -1981,6 +2092,7 @@ void auto_compaction_with_custom_cmp_function()
 
     // Open Database File
     config = fdb_get_default_config();
+    config.wal_threshold = 4096; // reset WAL threshold for correct file size estimation
     config.compaction_mode=FDB_COMPACTION_AUTO;
     config.compactor_sleep_duration = 1;
     config.compaction_threshold = 10;
@@ -2030,6 +2142,12 @@ void auto_compaction_with_custom_cmp_function()
         status = fdb_set_kv(db1, keybuf, strlen(keybuf),
                                  bodybuf, strlen(bodybuf));
         TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+        status = fdb_get_file_info(file, &file_info);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        if (file_info.file_size > max_filesize) {
+            max_filesize = file_info.file_size;
+        }
     }
     // Commit
     status = fdb_commit(file, FDB_COMMIT_NORMAL);
@@ -2037,20 +2155,22 @@ void auto_compaction_with_custom_cmp_function()
 
     status = fdb_get_file_info(file, &file_info);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
-    old_filesize = file_info.file_size;
+    if (file_info.file_size > max_filesize) {
+        max_filesize = file_info.file_size;
+    }
 
-    printf("wait for max 10 seconds..\n");
-    for(i=0; i<10; ++i) {
+    printf("wait for daemon compaction completion... (max file size: %" _F64 ")\n", max_filesize);
+    while (true) {
         sleep(1);
 
         status = fdb_get_file_info(file, &file_info);
         TEST_CHK(status == FDB_RESULT_SUCCESS);
-        if (file_info.file_size < old_filesize) {
+        if (file_info.file_size < max_filesize) {
             break;
         }
     }
     // should be compacted
-    TEST_CHK(file_info.file_size < old_filesize);
+    TEST_CHK(file_info.file_size < max_filesize);
 
     status = fdb_close(file);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -2251,22 +2371,39 @@ static fdb_compact_decision cb_upt(fdb_file_handle *fhandle,
                 }
             }
             args->done = 1;
-        }
-        if (args->nmoves > n && args->done == 1) {
+        } else if (args->nmoves > n && args->done == 1) {
             // the first phase is done. insert new docs.
-            for (i=0;i<2;++i){
-                sprintf(keybuf, "xxx%d", i);
-                sprintf(bodybuf, "xxxvalue%d", i);
-                s = fdb_set_kv(args->handle, keybuf, strlen(keybuf)+1,
-                                             bodybuf, strlen(bodybuf)+1);
-                TEST_CHK(s == FDB_RESULT_SUCCESS);
-                s = fdb_commit(args->file, FDB_COMMIT_NORMAL);
-                TEST_CHK(s == FDB_RESULT_SUCCESS);
-            }
+            i = 0;
+            sprintf(keybuf, "xxx%d", i);
+            sprintf(bodybuf, "xxxvalue%d", i);
+            s = fdb_set_kv(args->handle, keybuf, strlen(keybuf)+1,
+                           bodybuf, strlen(bodybuf)+1);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            s = fdb_commit(args->file, FDB_COMMIT_NORMAL);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            i = 1;
+            sprintf(keybuf, "xxx%d", i);
+            sprintf(bodybuf, "xxxvalue%d", i);
+            s = fdb_begin_transaction(args->file, FDB_ISOLATION_READ_COMMITTED);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            s = fdb_set_kv(args->handle, keybuf, strlen(keybuf)+1,
+                           bodybuf, strlen(bodybuf)+1);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            s = fdb_end_transaction(args->file, FDB_COMMIT_NORMAL);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
             args->done = 2;
-        }
-        if (args->nmoves == (n*3/2 + 2) && args->done == 2) {
+        } else if (args->nmoves == (n*3/2 + 2) && args->done == 2) {
             // during the second-second phase,
+            i = 1;
+            sprintf(keybuf, "xxx%d", i);
+            sprintf(bodybuf, "xxxvalue%d", i);
+            s = fdb_begin_transaction(args->file, FDB_ISOLATION_READ_COMMITTED);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            s = fdb_set_kv(args->handle, keybuf, strlen(keybuf)+1,
+                           bodybuf, strlen(bodybuf)+1);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+            s = fdb_end_transaction(args->file, FDB_COMMIT_NORMAL);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
             // insert new docs, and do not commit.
             for (i=0;i<2;++i){
                 sprintf(keybuf, "zzz%d", i);
@@ -2276,11 +2413,16 @@ static fdb_compact_decision cb_upt(fdb_file_handle *fhandle,
                 TEST_CHK(s == FDB_RESULT_SUCCESS);
             }
             args->done = 3;
+        } else if (args->done == 3) {
+            if (args->nmoves == n*3/2 + 2 // docs inserted after phase 1
+                                + 3) { // 3 docs inserted in last phase above
+                args->done = 4; // Don't do this for second fdb_compact() call
+            }
         }
         TEST_CMP(kv_name, "db", 2);
     }
 
-    return 0;
+    return FDB_CS_KEEP_DOC;
 }
 
 void compaction_with_concurrent_update_test()
@@ -2435,9 +2577,9 @@ static int compaction_del_cb(fdb_file_handle *fhandle,
     } else if (status == FDB_CS_END) {
         TEST_CHK(!kv_name);
         if (db) { // At end of first phase, mutate more docs...
-            s = fdb_open(&dbfile, "./compact_test1", &fhandle->root->config);
+            s = fdb_open(&dbfile, "./compact_test1", &fhandle->getRootHandle()->config);
             TEST_CHK(s == FDB_RESULT_SUCCESS);
-            s = fdb_kvs_open_default(dbfile, &db, &db->kvs_config);
+            fdb_kvs_open_default(dbfile, &db, &db->kvs_config);
             for (i = 0; i < n; ++i){
                 sprintf(keybuf, "key%d", i);
                 s = fdb_del_kv(db, keybuf, strlen(keybuf));
@@ -2512,7 +2654,7 @@ void compact_deleted_doc_test()
     // At end of phase 1, all documents get deleted
     s = fdb_compact(dbfile, "compact_test2");
     TEST_CHK(s == FDB_RESULT_SUCCESS);
-    TEST_CHK(wal_get_num_flushable(dbfile->root->file) == 0);
+    TEST_CHK(dbfile->getRootHandle()->file->getWal()->getNumFlushable_Wal() == 0);
 
     for (i=0;i<n;++i){
         sprintf(keybuf, "key%d", i);
@@ -2555,6 +2697,7 @@ void compact_upto_twice_test()
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.block_reusing_threshold = 0;
 
     // open db
     fdb_open(&dbfile, "./compact_test1", &fconfig);
@@ -2572,7 +2715,7 @@ void compact_upto_twice_test()
     status = fdb_get_all_snap_markers(dbfile, &markers,
                                       &num_markers);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
-    status = fdb_compact_upto(dbfile, NULL, markers[5].marker);
+    status = fdb_compact_upto(dbfile, NULL, markers[num_markers-1].marker);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_free_snap_markers(markers, num_markers);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -2581,7 +2724,7 @@ void compact_upto_twice_test()
     status = fdb_get_all_snap_markers(dbfile, &markers,
                                       &num_markers);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
-    status = fdb_compact_upto(dbfile, NULL, markers[1].marker);
+    status = fdb_compact_upto(dbfile, NULL, markers[num_markers-2].marker);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     status = fdb_free_snap_markers(markers, num_markers);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
@@ -2707,6 +2850,8 @@ void compact_upto_post_snapshot_test()
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.wal_threshold = 1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    // prevent block reusing to keep snapshots
+    fconfig.block_reusing_threshold = 0;
 
     // open db
     fdb_open(&dbfile, "./compact_test1", &fconfig);
@@ -2822,6 +2967,7 @@ void compact_upto_overwrite_test(int opt)
     config.wal_flush_before_commit = true;
     config.multi_kv_instances = true;
     config.buffercache_size = 0;
+    config.block_reusing_threshold = 0;
 
     commit_opt = (opt)?FDB_COMMIT_NORMAL:FDB_COMMIT_MANUAL_WAL_FLUSH;
 
@@ -2863,7 +3009,7 @@ void compact_upto_overwrite_test(int opt)
     s = fdb_get_all_snap_markers(db_file, &markers, &n_markers);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
 
-    int upto = n/2;
+    int upto = n_markers/2 - 1;
     s = fdb_compact_upto(db_file, "./compact_test2", markers[upto].marker);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
 
@@ -2980,6 +3126,8 @@ static int compaction_cb_get(fdb_file_handle *fhandle,
     s = fdb_get_all_snap_markers(fhandle, &markers, &num_markers);
     TEST_CHK(s == FDB_RESULT_SUCCESS);
     seqno = markers[0].kvs_markers[0].seqnum;
+    s = fdb_free_snap_markers(markers, num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
 
     // snapshot open
     s = fdb_snapshot_open(args->handle, &snap_db, seqno);
@@ -3081,8 +3229,8 @@ static int compaction_cb_markers(fdb_file_handle *fhandle,
     TEST_CHK(seqno == n);
 
     // snapshot open for each kvs for each marker
-    for(j=0;j<num_markers;++j){
-        for (i=0;i<(uint64_t)markers[j].num_kvs_markers;++i){
+    for (j = 0; j < num_markers; ++j){
+        for (i = 0; i < (uint64_t)markers[j].num_kvs_markers; ++i){
             // open kv for this marker
             fdb_kvs_open(fhandle, &db,
                          markers[j].kvs_markers[i].kv_store_name, &kvs_config);
@@ -3096,6 +3244,8 @@ static int compaction_cb_markers(fdb_file_handle *fhandle,
             TEST_CHK(s==FDB_RESULT_SUCCESS);
         }
     }
+    s = fdb_free_snap_markers(markers, num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
     return 0;
 }
 
@@ -3164,13 +3314,389 @@ void compact_with_snapshot_open_multi_kvs_test()
     TEST_RESULT("compact with snapshot_open multi kvs test");
 }
 
+
+static std::atomic<uint8_t> cancel_test_signal_begin(0);
+static std::atomic<uint8_t> cancel_test_signal_end(0);
+
+static int cb_cancel_test(fdb_file_handle *fhandle,
+                          fdb_compaction_status status, const char *kv_name,
+                          fdb_doc *doc, uint64_t old_offset, uint64_t new_offset,
+                          void *ctx)
+{
+    (void) fhandle;
+    (void) kv_name;
+    (void) doc;
+    (void) old_offset;
+    (void) new_offset;
+    (void) ctx;
+
+    if (status == FDB_CS_BEGIN) {
+        cancel_test_signal_begin = 1;
+    } else if (status == FDB_CS_END) {
+        cancel_test_signal_end = 1;
+    }
+
+    return 0;
+}
+
+void *db_compact_during_compaction_cancellation(void *args)
+{
+
+    TEST_INIT();
+
+    fdb_file_handle *dbfile;
+    fdb_status status;
+    fdb_config config;
+
+    // Open Database File
+    config = fdb_get_default_config();
+    config.compaction_cb = cb_cancel_test;
+    config.compaction_cb_ctx = NULL;
+    config.compaction_cb_mask = FDB_CS_BEGIN | FDB_CS_END;
+
+    status = fdb_open(&dbfile, "compact_test", &config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    // compaction thread enters here
+    status = fdb_compact(dbfile, NULL);
+    TEST_CHK(status == FDB_RESULT_SUCCESS ||
+             status == FDB_RESULT_COMPACTION_CANCELLATION ||
+             status == FDB_RESULT_FAIL_BY_ROLLBACK);
+    fdb_close(dbfile);
+
+    // shutdown
+    thread_exit(0);
+    return NULL;
+}
+
+typedef enum {
+    COMPACTION_CANCEL_MODE = 0,
+    COMPACTION_ROLLBACK_MODE = 1
+} compaction_test_mode;
+
+void compaction_cancellation_test(compaction_test_mode mode)
+{
+    TEST_INIT();
+
+    memleak_start();
+
+    int i, r, n=100000;
+    fdb_file_handle *file;
+    fdb_kvs_handle *kvs;
+    fdb_status status;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+
+    r = system(SHELL_DEL" compact_test* > errorlog.txt");
+    (void)r;
+
+    // Open Database File
+    config = fdb_get_default_config();
+    status = fdb_open(&file, "compact_test", &config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Open KV Store
+    kvs_config = fdb_get_default_kvs_config();
+    status = fdb_kvs_open_default(file, &kvs, &kvs_config);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    // Load kv pairs
+    for(i=0;i<n;i++) {
+        char str[15];
+        sprintf(str, "%d", i);
+        status = fdb_set_kv(kvs, str, strlen(str), (void*)"value", 5);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+        // Commit every 100 SETs
+        if (i % 100 == 0) {
+            status = fdb_commit(file, FDB_COMMIT_NORMAL);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+        }
+    }
+
+    thread_t tid;
+    void *thread_ret;
+    bool rollback_failed = false;
+
+    thread_create(&tid, db_compact_during_compaction_cancellation, NULL);
+
+    // wait until compaction begins
+    while (!cancel_test_signal_begin) {
+        usleep(1000); // Sleep for 1ms
+    }
+
+    if (mode == COMPACTION_ROLLBACK_MODE) {
+        // append more mutations
+        for(i=0;i<n/10;i++) {
+            char str[15];
+            sprintf(str, "%d", i);
+            status = fdb_set_kv(kvs, str, strlen(str), (void*)"value", 5);
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            // Commit every 100 SETs
+            if (i % 100 == 0) {
+                status = fdb_commit(file, FDB_COMMIT_NORMAL);
+                TEST_CHK(status == FDB_RESULT_SUCCESS);
+            }
+        }
+    }
+
+    if (mode == COMPACTION_CANCEL_MODE) {
+        // Cancel the compaction task
+        status = fdb_cancel_compaction(file);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    } else if (mode == COMPACTION_ROLLBACK_MODE) {
+        // Rollback
+
+        // wait until the 1st phase is done
+        while (!cancel_test_signal_end) {
+            usleep(1000); // Sleep for 1ms
+        }
+
+        status = fdb_rollback(&kvs, n/2 + 1);
+        if (status != FDB_RESULT_SUCCESS) {
+            // if compactor thread is done before reaching this line,
+            // rollback may fail.
+            rollback_failed = true;
+        }
+    }
+    // join compactor
+    thread_join(tid, &thread_ret);
+
+    // if rollback failed, we don't need to compact the file again.
+    if (!rollback_failed) {
+        // Compact the database
+        status = fdb_compact(file, NULL);
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    }
+
+    char key[15];
+    void *value;
+    size_t val_size;
+
+    for(i=0;i<n;i++) {
+        sprintf(key, "%d", i);
+        status = fdb_get_kv(kvs, key, strlen(key), &value, &val_size);
+        if (mode == COMPACTION_CANCEL_MODE) {
+            // compaction cancel mode: all docs should be retrieved
+            TEST_CHK(status == FDB_RESULT_SUCCESS);
+            fdb_free_block(value);
+        } else if (mode == COMPACTION_ROLLBACK_MODE) {
+            // rollback mode: only the first half docs should be retrieved
+            if (i<=n/2 || rollback_failed) {
+                // if rollback failed, all doc should be retrieved
+                TEST_CHK(status == FDB_RESULT_SUCCESS);
+                fdb_free_block(value);
+            } else {
+                TEST_CHK(status != FDB_RESULT_SUCCESS);
+            }
+        }
+    }
+
+    status = fdb_close(file);
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    status = fdb_shutdown();
+    TEST_CHK(status == FDB_RESULT_SUCCESS);
+
+    memleak_end();
+
+    if (mode == COMPACTION_CANCEL_MODE) {
+        TEST_RESULT("compaction cancellation test");
+    } else if (mode == COMPACTION_ROLLBACK_MODE) {
+        TEST_RESULT("rollback during the 2nd phase of compaction test");
+    }
+}
+
+void compact_upto_with_circular_reuse_test()
+{
+    TEST_INIT();
+    int batch=100, n_batch=64, n_dbs=3, i, j, r, k, idx;
+    int n_repeat = 4;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db[3];
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_doc *doc;
+    fdb_status s; (void)s;
+    char keybuf[256], valuebuf[512];
+
+    memleak_start();
+
+    // remove previous dummy files
+    r = system(SHELL_DEL" compact_test* > errorlog.txt");
+    (void)r;
+
+    config = fdb_get_default_config();
+    config.buffercache_size = 0;
+    config.num_keeping_headers = 10;
+    kvs_config = fdb_get_default_kvs_config();
+
+    // create a file
+    s = fdb_open(&dbfile, "compact_test", &config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db[0], NULL, &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db[1], "db1", &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db[2], "db2", &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    memset(valuebuf, 'x', 256);
+    valuebuf[256] = 0;
+    for (k=0; k<n_repeat; ++k) {
+        for (r=0; r<n_batch; ++r) {
+            for (j=1; j<n_dbs; ++j) {
+                for (i=0; i<batch; ++i) {
+                    idx = r*batch + i;
+                    sprintf(keybuf, "k%06d", idx);
+                    sprintf(valuebuf, "v%d_%04d_%d", j, idx, k);
+                    s = fdb_doc_create(&doc, keybuf, 8, NULL, 0, valuebuf, 257);
+                    TEST_CHK(s == FDB_RESULT_SUCCESS);
+                    s = fdb_set(db[j], doc);
+                    TEST_CHK(s == FDB_RESULT_SUCCESS);
+                    s = fdb_doc_free(doc);
+                    TEST_CHK(s == FDB_RESULT_SUCCESS);
+                }
+            }
+            s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+        }
+    }
+
+    fdb_snapshot_info_t *markers_out;
+    uint64_t num_markers;
+
+    s = fdb_get_all_snap_markers(dbfile, &markers_out, &num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // num_markers should be equal to or smaller than num_keeping_headers
+    TEST_CHK(num_markers <= config.num_keeping_headers);
+
+    s = fdb_compact_upto(dbfile, "compact_test_compact", markers_out[5].marker);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_free_snap_markers(markers_out, num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // all docs should be retrieved correclty.
+    k = n_repeat - 1;
+    for (r=0; r<n_batch; ++r) {
+        for (j=1; j<n_dbs; ++j) {
+            for (i=0; i<batch; ++i) {
+                idx = r*batch + i;
+                sprintf(keybuf, "k%06d", idx);
+                sprintf(valuebuf, "v%d_%04d_%d", j, idx, k);
+                s = fdb_doc_create(&doc, keybuf, 8, NULL, 0, NULL, 0);
+                TEST_CHK(s == FDB_RESULT_SUCCESS);
+                s = fdb_get(db[j], doc);
+                TEST_CHK(s == FDB_RESULT_SUCCESS);
+                TEST_CMP(doc->body, valuebuf, doc->bodylen);
+                s = fdb_doc_free(doc);
+                TEST_CHK(s == FDB_RESULT_SUCCESS);
+            }
+        }
+        s = fdb_commit(dbfile, FDB_COMMIT_NORMAL);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+
+    s = fdb_close(dbfile);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_shutdown();
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    memleak_end();
+
+    TEST_RESULT("compact upto with circular reuse test");
+}
+
+void compact_upto_last_wal_flush_bid_check()
+{
+    TEST_INIT();
+    int i, j;
+    int r;
+    int ndocs=1000;
+    int ncommit=20;
+    fdb_file_handle *dbfile;
+    fdb_kvs_handle *db;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_status s; (void)s;
+    char keybuf[256], valuebuf[512];
+
+    memleak_start();
+
+    // remove previous dummy files
+    r = system(SHELL_DEL" compact_test* > errorlog.txt");
+    (void)r;
+
+    config = fdb_get_default_config();
+    config.num_keeping_headers = 20;
+    kvs_config = fdb_get_default_kvs_config();
+
+    // create a file
+    s = fdb_open(&dbfile, "compact_test", &config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_kvs_open(dbfile, &db, "db", &kvs_config);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    memset(valuebuf, 'x', 200);
+    for (i=0; i<ncommit; ++i) {
+        for (j=0; j<ndocs; ++j) {
+            sprintf(keybuf, "k%06d", j);
+            sprintf(valuebuf, "v%d_%04d", i, j);
+            s = fdb_set_kv(db, keybuf, strlen(keybuf)+1, valuebuf, 200);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+        }
+        s = fdb_commit(dbfile, FDB_COMMIT_MANUAL_WAL_FLUSH);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+
+    fdb_snapshot_info_t *markers_out;
+    uint64_t num_markers;
+
+    s = fdb_get_all_snap_markers(dbfile, &markers_out, &num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // compact_upto() will copy DB headers to be kept
+    s = fdb_compact_upto(dbfile, "compact_test2", markers_out[15].marker);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_free_snap_markers(markers_out, num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_get_all_snap_markers(dbfile, &markers_out, &num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    // call compact_upto() again
+    // copying the previous DB headers should be done correctly.
+    s = fdb_compact_upto(dbfile, "compact_test3", markers_out[15].marker);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_free_snap_markers(markers_out, num_markers);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_close(dbfile);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
+    s = fdb_shutdown();
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+    memleak_end();
+
+    TEST_RESULT("compact upto last WAL flush bid check test");
+}
+
 int main(){
     int i;
 
     compact_deleted_doc_test();
+    open_newfile_before_compact_done();
     compact_upto_test(false); // single kv instance in file
     compact_upto_test(true); // multiple kv instance in file
+    compact_upto_last_wal_flush_bid_check();
     wal_delete_compact_upto_test();
+    compact_upto_with_circular_reuse_test();
     for (i=0;i<4;++i) {
         compact_upto_overwrite_test(i);
     }
@@ -3182,7 +3708,9 @@ int main(){
     compaction_callback_test(false); // single kv instance mode
     compact_wo_reopen_test();
     compact_with_reopen_test();
+#if !defined(THREAD_SANITIZER)
     compact_reopen_with_iterator();
+#endif
     compact_reopen_named_kvs();
     estimate_space_upto_test(false); // single kv instance in file
     estimate_space_upto_test(true); // multiple kv instance in file
@@ -3198,6 +3726,9 @@ int main(){
     auto_compaction_with_custom_cmp_function();
     compaction_daemon_test(20);
     auto_compaction_with_concurrent_insert_test(20);
+    compaction_cancellation_test(COMPACTION_CANCEL_MODE);
+    // Disable it temporarily until it is resolved.
+    //compaction_cancellation_test(COMPACTION_ROLLBACK_MODE);
 
     return 0;
 }

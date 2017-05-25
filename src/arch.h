@@ -26,6 +26,11 @@
 #include <fcntl.h>
 
 #include "forestdb_endian.h"
+
+#ifdef _PLATFORM_LIB_AVAILABLE
+#include <platform/platform.h>
+#endif // _PLATFORM_LIB_AVAILABLE
+
 /* Large File Support */
 #define _LARGE_FILE 1
 #ifndef _FILE_OFFSET_BITS
@@ -49,15 +54,62 @@
 #endif
 #endif
 
+#ifdef HAVE_JEMALLOC
+#ifdef WIN32
+/* jemalloc.h tries to include strings.h, but on win32
+   that is our own "hacked" version that provides stuff
+   we use elsewhere in the system. By including that
+   file you might end up having to link with the
+   platform lib which supplies a lot of the functions
+   forestdb also provides an implementation of (but
+   with a different linkage)
+*/
+#define STRINGS_H
+#endif
+
+/* string has some memory allocators of its own which MUST come first
+ in the include order to ensure that je_malloc can correctly override
+ the string malloc and free definitions too, otherwise we can have
+ asymmetrical operation resulting in crashes.
+ TODO: We plan to address this in a modularized way in the future.
+*/
+#include <string>
+#include <jemalloc/jemalloc.h>
+
+#ifdef WIN32
+#undef STRINGS_H
+#endif
+
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
+#undef posix_memalign
+#undef memalign
+#undef aligned_malloc
+#undef aligned_free
+
+#define malloc(size) je_malloc(size)
+#define calloc(nmemb, size) je_calloc(nmemb, size)
+#define realloc(ptr, size) je_realloc(ptr, size)
+#define free(addr) je_free(addr)
+#define posix_memalign(memptr, alignment, size) \
+        je_posix_memalign(memptr, alignment, size)
+#define memalign(alignment, size) je_memalign(alignment, size)
+#define aligned_malloc(size, align) je_aligned_malloc(size, align)
+#define aligned_free(addr) je_aligned_free(addr)
+#endif //HAVE_JEMALLOC
+
 #ifdef __APPLE__
     #include <inttypes.h>
     #include <alloca.h>
     #include <TargetConditionals.h>
+    #include <AvailabilityMacros.h>
 
     #define INLINE extern inline
 
     #define _X64 "llx"
-    #define _F64 "lld"
+    #define _F64 "llu"
     #define _FSEC "ld"
     #define _FUSEC "d"
 
@@ -67,19 +119,6 @@
     #define _ALIGN_MEM_ACCESS
     #endif
 
-    #ifdef HAVE_JEMALLOC
-    #include <jemalloc/jemalloc.h>
-    #define malloc(size) je_malloc(size)
-    #define calloc(nmemb, size) je_calloc(nmemb, size)
-    #define realloc(ptr, size) je_realloc(ptr, size)
-    #define free(addr) je_free(addr)
-    #define posix_memalign(memptr, alignment, size)\
-                           je_posix_memalign(memptr, alignment, size)
-    #define memalign(alignment, size) je_memalign(alignment, size)
-    #define aligned_malloc(size, align) je_aligned_malloc(size, align)
-    #define aligned_free(addr) je_aligned_free(addr)
-    #endif //HAVE_JEMALLOC
-
     #define malloc_align(addr, align, size) \
         {int __ret__; __ret__=posix_memalign(&(addr), (align), (size));\
          (void)__ret__;}
@@ -88,11 +127,24 @@
     #ifndef spin_t
         // spinlock
         #include <libkern/OSAtomic.h>
-        #define spin_t OSSpinLock
-        #define spin_lock(arg) OSSpinLockLock(arg)
-        #define spin_unlock(arg) OSSpinLockUnlock(arg)
-        #define SPIN_INITIALIZER (spin_t)(0)
-        #define spin_init(arg) *(arg) = (spin_t)(0)
+        #ifndef MAC_OS_X_VERSION_10_12
+            #define MAC_OS_X_VERSION_10_12 101200
+        #endif
+        #if MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_12
+            #include <os/lock.h>
+            #define spin_t os_unfair_lock
+            #define spin_lock(arg) os_unfair_lock_lock(arg)
+            #define spin_trylock(arg) os_unfair_lock_trylock(arg)
+            #define spin_unlock(arg) os_unfair_lock_unlock(arg)
+            #define spin_init(arg) *(arg) = OS_UNFAIR_LOCK_INIT
+        #else
+            #define spin_t OSSpinLock
+            #define spin_lock(arg) OSSpinLockLock(arg)
+            #define spin_trylock(arg) OSSpinLockTry(arg)
+            #define spin_unlock(arg) OSSpinLockUnlock(arg)
+            #define SPIN_INITIALIZER (spin_t)(0)
+            #define spin_init(arg) *(arg) = (spin_t)(0)
+        #endif
         #define spin_destroy(arg)
     #endif
     #ifndef mutex_t
@@ -135,12 +187,24 @@
 
     #define INLINE static __inline
 
-    #define _X64 "llx"
-    #define _F64 "lld"
-    #define _FSEC "ld"
-    #define _FUSEC "ld"
+    #if defined(__arm__) || defined(__i386__) || defined(__mips32__)
+        #define _X64 "llx"
+        #define _F64 "llu"
+        #define _FSEC "lld"
+        #define _FUSEC "lld"
+    #else
+        #define _X64 "lx"
+        #define _F64 "lu"
+        #define _FSEC "ld"
+        #define _FUSEC "ld"
+    #endif // 32-bit vs 64-bit platform check
 
     #define _ARCH_O_DIRECT (O_DIRECT)
+
+    #if defined(__arm__) || defined(__mips32__)
+    #define _ALIGN_MEM_ACCESS
+    #endif
+
     #define malloc_align(addr, align, size) \
         (addr = memalign((align), (size)))
     #define free_align(addr) free(addr)
@@ -151,6 +215,8 @@
         #define spin_t pthread_mutex_t
         #define spin_init(arg) pthread_mutex_init(arg, NULL)
         #define spin_lock(arg) pthread_mutex_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_mutex_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_mutex_unlock(arg)
         #define spin_destroy(arg) pthread_mutex_destroy(arg)
         #define SPIN_INITIALIZER ((spin_t)PTHREAD_MUTEX_INITIALIZER)
@@ -194,6 +260,68 @@
     #endif
     #define assert(a) (a)
 
+#elif __linux__ && __arm__
+    #include <inttypes.h>
+    #include <alloca.h>
+
+    #define INLINE static __inline
+
+    #define _X64 "llx"
+    #define _F64 "llu"
+    #define _FSEC "ld"
+    #define _FUSEC "ld"
+
+    #define _ARCH_O_DIRECT (O_DIRECT)
+    #define malloc_align(addr, align, size) \
+        (addr = memalign((align), (size)))
+    #define free_align(addr) free(addr)
+
+    #ifndef spin_t
+        // spinlock
+        #include <pthread.h>
+        #define spin_t pthread_spinlock_t
+        #define spin_init(arg) pthread_spin_init(arg, PTHREAD_PROCESS_SHARED)
+        #define spin_lock(arg) pthread_spin_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_spin_trylock(arg) == 0)
+        #define spin_unlock(arg) pthread_spin_unlock(arg)
+        #define spin_destroy(arg) pthread_spin_destroy(arg)
+        #define SPIN_INITIALIZER (spin_t)(0)
+    #endif
+    #ifndef mutex_t
+        // mutex
+        #include <pthread.h>
+        #define mutex_t pthread_mutex_t
+        #define mutex_init(arg) pthread_mutex_init(arg, NULL)
+        #define mutex_lock(arg) pthread_mutex_lock(arg)
+        #define mutex_trylock(arg) \
+            (pthread_mutex_trylock(arg) == 0)
+        #define mutex_unlock(arg) pthread_mutex_unlock(arg)
+        #define MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+        #define mutex_destroy(arg) pthread_mutex_destroy(arg)
+    #endif
+    #ifndef thread_t
+        // thread
+        #include <pthread.h>
+        #define thread_t pthread_t
+        #define thread_cond_t pthread_cond_t
+        #define thread_create(tid, func, args) \
+            pthread_create((tid), NULL, (func), (args))
+        #define thread_join(tid, ret) pthread_join(tid, ret)
+        #define thread_cancel(tid) pthread_cancel(tid)
+        #define thread_exit(code) pthread_exit(code)
+        #define thread_cond_init(cond) pthread_cond_init(cond, NULL)
+        #define thread_cond_destroy(cond) pthread_cond_destroy(cond)
+        #define thread_cond_wait(cond, mutex) pthread_cond_wait(cond, mutex)
+        #define thread_cond_timedwait(cond, mutex, ms) \
+            { \
+            struct timespec ts = convert_reltime_to_abstime(ms); \
+            pthread_cond_timedwait(cond, mutex, &ts); \
+            }
+        #define thread_cond_signal(cond) pthread_cond_signal(cond)
+        #define thread_cond_broadcast(cond) pthread_cond_broadcast(cond)
+    #endif
+
 #elif __linux__
     #include <inttypes.h>
     #include <alloca.h>
@@ -207,19 +335,6 @@
 
     #define _ARCH_O_DIRECT (O_DIRECT)
 
-    #ifdef HAVE_JEMALLOC
-    #include <jemalloc/jemalloc.h>
-    #define malloc(size) je_malloc(size)
-    #define calloc(nmemb, size) je_calloc(nmemb, size)
-    #define realloc(ptr, size) je_realloc(ptr, size)
-    #define free(addr) je_free(addr)
-    #define posix_memalign(memptr, alignment, size)\
-                           je_posix_memalign(memptr, alignment, size)
-    #define memalign(alignment, size) je_memalign(alignment, size)
-    #define aligned_malloc(size, align) je_aligned_malloc(size, align)
-    #define aligned_free(addr) je_aligned_free(addr)
-    #endif //HAVE_JEMALLOC
-
     #define malloc_align(addr, align, size) \
         {int __ret__; __ret__=posix_memalign(&(addr), (align), (size));\
          (void)__ret__;}
@@ -231,9 +346,15 @@
         #define spin_t pthread_spinlock_t
         #define spin_init(arg) pthread_spin_init(arg, PTHREAD_PROCESS_SHARED)
         #define spin_lock(arg) pthread_spin_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_spin_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_spin_unlock(arg)
         #define spin_destroy(arg) pthread_spin_destroy(arg)
-        #define SPIN_INITIALIZER (spin_t)(1)
+        #if defined(__GLIBC__) && !defined(__s390x__)
+            #define SPIN_INITIALIZER (spin_t)(1)
+        #else
+            #define SPIN_INITIALIZER (spin_t)(0)
+        #endif
     #endif
     #ifndef mutex_t
         // mutex
@@ -278,6 +399,9 @@
     #define _ARCH_O_DIRECT (0x0)
 
 #ifdef _MSC_VER
+    #define NOMINMAX 1
+    #include <winsock2.h>
+    #undef NOMINMAX
     // visual studio CL compiler
     #include <Windows.h>
     #include "gettimeofday_vs.h"
@@ -288,11 +412,16 @@
 #ifndef _CRT_SECURE_NO_WARNINGS
     #define _CRT_SECURE_NO_WARNINGS
 #endif
+#ifndef _PLATFORM_LIB_AVAILABLE
+    // In case of Couchbase Server Builds, platform library
+    // is included, which already contains the following
+    // definitions.
     #define gettimeofday gettimeofday_vs
+    typedef SSIZE_T ssize_t;
+#endif // _PLATFORM_LIB_AVAILABLE
     #define sleep(sec) Sleep((sec)*1000)
     typedef unsigned long mode_t;
     #include <BaseTsd.h>
-    typedef SSIZE_T ssize_t;
 #else
     #include <inttypes.h>
     #include <windows.h>
@@ -311,6 +440,7 @@
         #define spin_t CRITICAL_SECTION
         #define spin_init(arg) InitializeCriticalSection(arg)
         #define spin_lock(arg) EnterCriticalSection(arg)
+        #define spin_trylock(arg) TryEnterCriticalSection(arg)
         #define spin_unlock(arg) LeaveCriticalSection(arg)
         #define spin_destroy(arg) DeleteCriticalSection(arg)
     #endif
@@ -369,6 +499,8 @@
         #define spin_t pthread_spinlock_t
         #define spin_init(arg) pthread_spin_init(arg, PTHREAD_PROCESS_SHARED)
         #define spin_lock(arg) pthread_spin_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_spin_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_spin_unlock(arg)
         #define spin_destroy(arg) pthread_spin_destroy(arg)
         #define SPIN_INITIALIZER (spin_t)(1)
@@ -438,6 +570,8 @@
         #define spin_t pthread_mutex_t
         #define spin_init(arg) pthread_mutex_init(arg, NULL)
         #define spin_lock(arg) pthread_mutex_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_mutex_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_mutex_unlock(arg)
         #define spin_destroy(arg) pthread_mutex_destroy(arg)
         #define SPIN_INITIALIZER PTHREAD_MUTEX_INITIALIZER
@@ -498,6 +632,8 @@
         #define spin_t pthread_mutex_t
         #define spin_init(arg) pthread_mutex_init(arg, NULL)
         #define spin_lock(arg) pthread_mutex_lock(arg)
+        #define spin_trylock(arg) \
+            (pthread_mutex_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_mutex_unlock(arg)
         #define spin_destroy(arg) pthread_mutex_destroy(arg)
         #define SPIN_INITIALIZER PTHREAD_MUTEX_INITIALIZER
